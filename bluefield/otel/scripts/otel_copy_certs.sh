@@ -30,7 +30,7 @@ any_missing() {
 any_too_old() {
     local now_ts dest_ts age_seconds max_age_seconds
     now_ts=$(date +%s)
-    max_age_seconds=$(( max_age_days * 24 * 60 * 60 ))
+    max_age_seconds=$(( MAX_AGE_DAYS * 24 * 60 * 60 ))
 
     for f in "$DST_CA" "$DST_CERT" "$DST_KEY"; do
         [[ -f "$f" ]] || continue
