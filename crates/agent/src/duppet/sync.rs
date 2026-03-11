@@ -130,7 +130,7 @@ pub fn sync_files(
 pub fn sync_file_now_or_later(
     path: &Path,
     mut spec: FileSpec,
-    options: SyncOptions,
+    options: SyncOptions, // async task requires taking ownership
 ) -> io::Result<SyncOutcome> {
     let content = spec.content.take(); // avoid partial moves and borrow/move conflicts
     match content {

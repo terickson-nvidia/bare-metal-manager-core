@@ -31,7 +31,7 @@ use rpc::forge_tls_client::{ForgeClientConfig, ForgeClientT};
 use crate::duppet::{self, FileEnsure, PendingSync, SyncOptions, SyncStatus};
 use crate::periodic_config_fetcher::PeriodicConfigFetcher;
 
-async fn get_interface(
+async fn get_interface_list(
     client: &mut ForgeClientT,
     interface: MachineInterfaceId,
 ) -> Result<InterfaceList, eyre::Error> {
@@ -40,17 +40,15 @@ async fn get_interface(
         ip: None,
     });
 
-    let resp = match client.find_interfaces(request).await {
-        Ok(response) => response,
+    match client.find_interfaces(request).await {
+        Ok(response) => Ok(response.into_inner()),
         Err(err) => {
-            return Err(eyre::eyre!(
+            Err(eyre::eyre!(
                 "Error while executing the FindInterfaces gRPC call: {}",
                 err.to_string()
-            ));
+            ))
         }
-    };
-
-    Ok(resp.into_inner())
+    }
 }
 
 fn take_single<T>(mut items: Vec<T>) -> Result<T, eyre::Error> {
@@ -68,7 +66,7 @@ async fn get_host_machine_id(
 ) -> Result<Option<String>, eyre::Error> {
     if let Some(interface_id) = fetcher.get_host_machine_interface_id() {
         let mut client = create_forge_client(forge_api, &forge_client_config).await?;
-        let interface_list = get_interface(&mut client, MachineInterfaceId::from_str(&interface_id)?)
+        let interface_list = get_interface_list(&mut client, MachineInterfaceId::from_str(&interface_id)?)
             .await
             .map_err(|e| {
                 tracing::error!("get_interface({}) failed: {:?}", interface_id, e);
