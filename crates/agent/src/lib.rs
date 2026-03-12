@@ -35,6 +35,7 @@ use version_compare::{Part, Version};
 use crate::duppet::{SummaryFormat, SyncOptions};
 use crate::frr::FrrVlanConfig;
 use crate::health::HealthCheckParams;
+use crate::host_machine_id::get_host_machine_id_retry;
 
 pub mod dpu;
 
@@ -55,6 +56,7 @@ pub mod duppet;
 mod frr;
 mod hbn;
 mod health;
+mod host_machine_id;
 mod instance_metadata_endpoint;
 pub mod instrumentation;
 mod interfaces;
@@ -227,35 +229,31 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 register(&agent).await.wrap_err("registration error")?;
 
             let forge_api_server = agent.forge_system.api_server.clone();
-            let periodic_config_fetcher = Arc::new(
-                periodic_config_fetcher::PeriodicConfigFetcher::new(
-                    periodic_config_fetcher::PeriodicConfigFetcherConfig {
-                        config_fetch_interval: Duration::from_secs(
-                            agent.period.network_config_fetch_secs,
-                        ),
-                        machine_id,
-                        forge_api: forge_api_server.clone(),
-                        forge_client_config: forge_client_config.clone(),
-                    },
-                )
-                .await,
-            );
+            let periodic_config_fetcher = periodic_config_fetcher::PeriodicConfigFetcher::new(
+                periodic_config_fetcher::PeriodicConfigFetcherConfig {
+                    config_fetch_interval: Duration::from_secs(
+                        agent.period.network_config_fetch_secs,
+                    ),
+                    machine_id,
+                    forge_api: forge_api_server.clone(),
+                    forge_client_config: Arc::clone(&forge_client_config),
+                },
+            )
+            .await;
 
-            match managed_files::main_sync(
-                sync_options.clone(),
-                &machine_id,
-                periodic_config_fetcher,
-                forge_client_config.clone(),
-                forge_api_server.clone(),
-            ) {
-                Ok((_, pending)) => {
-                    duppet::print_pending_syncs(pending, sync_options).await?;
-                    // print_pending_syncs already logged any errors
-                }
+            let host_machine_id = match get_host_machine_id_retry(
+                &periodic_config_fetcher,
+                Arc::clone(&forge_client_config),
+                &forge_api_server,
+            ).await {
+                Ok(id) => id,
                 Err(e) => {
-                    tracing::error!("error during duppet run: {}", e)
+                    tracing::error!("get_host_machine_id_retry() failed: {:?}", e);
+                    return Err(e);
                 }
-            }
+            };
+
+            managed_files::main_sync(sync_options, &machine_id, &host_machine_id);
         }
 
         // Output a templated file

@@ -46,9 +46,10 @@ use version_compare::Version;
 use crate::dpu::DpuNetworkInterfaces;
 use crate::dpu::interface::Interface;
 use crate::dpu::route::{DpuRoutePlan, IpRoute, Route};
-use crate::duppet::{self, SummaryFormat, SyncOptions};
+use crate::duppet::{SummaryFormat, SyncOptions};
 use crate::ethernet_virtualization::ServiceAddresses;
 use crate::health::HealthCheckParams;
+use crate::host_machine_id::get_host_machine_id_retry;
 use crate::instance_metadata_endpoint::InstanceMetadataRouterStateImpl;
 use crate::instrumentation::{create_metrics, get_dpu_agent_meter};
 use crate::machine_inventory_updater::MachineInventoryUpdaterConfig;
@@ -177,19 +178,29 @@ pub async fn setup_and_run(
 
     let build_version = carbide_version::v!(build_version).to_string();
 
-    let periodic_config_fetcher = Arc::new(
-        periodic_config_fetcher::PeriodicConfigFetcher::new(
-            periodic_config_fetcher::PeriodicConfigFetcherConfig {
-                config_fetch_interval: Duration::from_secs(
-                    agent_config.period.network_config_fetch_secs,
-                ),
-                machine_id,
-                forge_api: forge_api_server.clone(),
-                forge_client_config: forge_client_config.clone(),
-            },
-        )
-        .await,
-    );
+    let periodic_config_fetcher = periodic_config_fetcher::PeriodicConfigFetcher::new(
+        periodic_config_fetcher::PeriodicConfigFetcherConfig {
+            config_fetch_interval: Duration::from_secs(
+                agent_config.period.network_config_fetch_secs,
+            ),
+            machine_id,
+            forge_api: forge_api_server.clone(),
+            forge_client_config: Arc::clone(&forge_client_config),
+        },
+    )
+    .await;
+
+    let host_machine_id = match get_host_machine_id_retry(
+        &periodic_config_fetcher,
+        Arc::clone(&forge_client_config),
+        &forge_api_server,
+    ).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("get_host_machine_id_retry() failed: {:?}", e);
+            return Err(e);
+        }
+    };
 
     let duppet_options = SyncOptions {
         dry_run: false,
@@ -198,22 +209,8 @@ pub async fn setup_and_run(
         summary_format: SummaryFormat::PlainText,
     };
 
-    match managed_files::main_sync(
-        duppet_options.clone(),
-        &machine_id,
-        periodic_config_fetcher.clone(),
-        forge_client_config.clone(),
-        forge_api_server.clone(),
-    ) {
-        Ok((_, pending)) => {
-            // fire-and-forget
-            tokio::spawn(duppet::print_pending_syncs(pending, duppet_options));
-        }
-        Err(e) => {
-            tracing::error!("error during duppet run: {}", e)
-        }
-    }
-        
+    managed_files::main_sync(duppet_options, &machine_id, &host_machine_id);
+
     if let Err(e) = lldp::set_lldp_system_description(&machine_id) {
         tracing::warn!("Couldn't update LLDP system description: {e}")
     }
