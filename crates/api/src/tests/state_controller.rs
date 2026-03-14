@@ -28,6 +28,8 @@ use model::controller_outcome::PersistentStateHandlerOutcome;
 use serde::{self, Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{FromRow, PgConnection, Row};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::state_controller::config::IterationConfig;
 use crate::state_controller::controller::{self, Enqueuer, QueuedObject, StateController};
@@ -45,8 +47,15 @@ use crate::tests::common::test_meter::TestMeter;
 #[crate::sqlx_test]
 async fn test_start_iteration(pool: sqlx::PgPool) -> eyre::Result<()> {
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     // First iteration can acquire the lock
     let result = controller::db::lock_and_start_iteration(
@@ -87,8 +96,15 @@ async fn test_start_iteration(pool: sqlx::PgPool) -> eyre::Result<()> {
 #[crate::sqlx_test]
 async fn test_delete_outdated_iterations(pool: sqlx::PgPool) -> eyre::Result<()> {
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     // If we insert up to 10 iterations, all of them shoudl be visible
     for i in 1..=10 {
@@ -434,6 +450,9 @@ impl StateHandlerContextObjects for TestStateControllerContextObjects {
     type ObjectMetrics = ();
 }
 
+#[derive(Debug, Default)]
+struct PanicInListObjectsStateControllerIO;
+
 async fn create_test_state_controller_tables(pool: &sqlx::PgPool) {
     let mut txn = pool.begin().await.unwrap();
 
@@ -612,6 +631,110 @@ impl StateControllerIO for TestStateControllerIO {
     }
 }
 
+#[async_trait::async_trait]
+impl StateControllerIO for PanicInListObjectsStateControllerIO {
+    type ObjectId = String;
+    type State = TestObject;
+    type ControllerState = TestObjectControllerState;
+    type MetricsEmitter = NoopMetricsEmitter;
+    type ContextObjects = TestStateControllerContextObjects;
+
+    const DB_ITERATION_ID_TABLE_NAME: &'static str = "test_state_controller_iteration_ids";
+    const DB_QUEUED_OBJECTS_TABLE_NAME: &'static str = "test_state_controller_queued_objects";
+
+    const LOG_SPAN_CONTROLLER_NAME: &'static str = "test_state_controller";
+
+    async fn list_objects(
+        &self,
+        _txn: &mut PgConnection,
+    ) -> Result<Vec<Self::ObjectId>, DatabaseError> {
+        panic!("test panic from list_objects");
+    }
+
+    async fn load_object_state(
+        &self,
+        _txn: &mut PgConnection,
+        _object_id: &Self::ObjectId,
+    ) -> Result<Option<Self::State>, DatabaseError> {
+        unreachable!("load_object_state should never be called in this test")
+    }
+
+    async fn load_controller_state(
+        &self,
+        _txn: &mut PgConnection,
+        _object_id: &Self::ObjectId,
+        _state: &Self::State,
+    ) -> Result<Versioned<Self::ControllerState>, DatabaseError> {
+        unreachable!("load_controller_state should never be called in this test")
+    }
+
+    async fn persist_controller_state(
+        &self,
+        _txn: &mut PgConnection,
+        _object_id: &Self::ObjectId,
+        _old_version: ConfigVersion,
+        _new_state: &Self::ControllerState,
+    ) -> Result<(), DatabaseError> {
+        unreachable!("persist_controller_state should never be called in this test")
+    }
+
+    async fn persist_outcome(
+        &self,
+        _txn: &mut PgConnection,
+        _object_id: &Self::ObjectId,
+        _outcome: PersistentStateHandlerOutcome,
+    ) -> Result<(), DatabaseError> {
+        unreachable!("persist_outcome should never be called in this test")
+    }
+
+    fn metric_state_names(state: &TestObjectControllerState) -> (&'static str, &'static str) {
+        TestStateControllerIO::metric_state_names(state)
+    }
+
+    fn state_sla(state: &Versioned<Self::ControllerState>) -> StateSla {
+        TestStateControllerIO::state_sla(state)
+    }
+}
+
+#[crate::sqlx_test]
+async fn test_state_controller_handle_set_wait_all_propagates_panic(
+    pool: sqlx::PgPool,
+) -> eyre::Result<()> {
+    create_test_state_controller_tables(&pool).await;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
+
+    StateController::<PanicInListObjectsStateControllerIO>::builder()
+        .iteration_config(IterationConfig {
+            iteration_time: Duration::from_millis(10),
+            processor_dispatch_interval: Duration::from_millis(10),
+            ..Default::default()
+        })
+        .database(pool.clone(), work_lock_manager_handle.clone())
+        .processor_id(uuid::Uuid::new_v4().to_string())
+        .services(Arc::new(()))
+        .state_handler(Arc::new(TestTransitionStateHandler))
+        .build_and_spawn(&mut join_set, cancel_token.clone())?;
+
+    let wait_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::spawn(async move { join_set.join_all().await }),
+    )
+    .await
+    .expect("timed out waiting for wait_all to return");
+
+    assert!(wait_result.expect_err("wait_all should panic").is_panic());
+
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct TestConcurrencyStateHandler {
     /// The total count for the handler
@@ -650,8 +773,15 @@ async fn test_multiple_state_controllers_schedule_object_only_once(
     pool: sqlx::PgPool,
 ) -> eyre::Result<()> {
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     let num_objects = 4;
     let mut object_ids = Vec::new();
@@ -670,28 +800,24 @@ async fn test_multiple_state_controllers_schedule_object_only_once(
 
     // We build multiple state controllers. But since only one should act at a time,
     // the count should still not increase
-    let mut handles = Vec::new();
     for _ in 0..10 {
-        handles.push(
-            StateController::<TestStateControllerIO>::builder()
-                .iteration_config(IterationConfig {
-                    iteration_time: ITERATION_TIME,
-                    processor_dispatch_interval: std::time::Duration::from_millis(10),
-                    ..Default::default()
-                })
-                .database(pool.clone(), work_lock_manager_handle.clone())
-                .processor_id(uuid::Uuid::new_v4().to_string())
-                .services(Arc::new(()))
-                .state_handler(state_handler.clone())
-                .build_and_spawn()
-                .unwrap(),
-        );
+        StateController::<TestStateControllerIO>::builder()
+            .iteration_config(IterationConfig {
+                iteration_time: ITERATION_TIME,
+                processor_dispatch_interval: std::time::Duration::from_millis(10),
+                ..Default::default()
+            })
+            .database(pool.clone(), work_lock_manager_handle.clone())
+            .processor_id(uuid::Uuid::new_v4().to_string())
+            .services(Arc::new(()))
+            .state_handler(state_handler.clone())
+            .build_and_spawn(&mut join_set, cancel_token.clone())
+            .unwrap();
     }
 
     tokio::time::sleep(TEST_TIME).await;
-    drop(handles);
-    // Wait some extra time until the controller background task shuts down
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    cancel_token.cancel();
+    join_set.join_all().await;
 
     let count = state_handler.count.load(Ordering::SeqCst) as f64;
     assert!(
@@ -783,8 +909,15 @@ async fn test_state_handler_metrics_are_stable(pool: sqlx::PgPool) -> eyre::Resu
     let test_meter = TestMeter::default();
 
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     let num_objects = 100;
     let mut object_ids = Vec::new();
@@ -800,10 +933,11 @@ async fn test_state_handler_metrics_are_stable(pool: sqlx::PgPool) -> eyre::Resu
     const TEST_TIME: Duration = Duration::from_secs(10);
     let start_time = std::time::Instant::now();
 
-    let _handle = StateController::<TestStateControllerIO>::builder()
+    StateController::<TestStateControllerIO>::builder()
         .iteration_config(IterationConfig {
             iteration_time: ITERATION_TIME,
             processor_dispatch_interval: std::time::Duration::from_millis(10),
+            metric_emission_interval: std::time::Duration::from_millis(10),
             max_concurrency: num_objects,
             ..Default::default()
         })
@@ -812,7 +946,7 @@ async fn test_state_handler_metrics_are_stable(pool: sqlx::PgPool) -> eyre::Resu
         .processor_id(uuid::Uuid::new_v4().to_string())
         .services(Arc::new(()))
         .state_handler(state_handler.clone())
-        .build_and_spawn()
+        .build_and_spawn(&mut join_set, cancel_token.clone())
         .unwrap();
 
     // Check metrics periodically. We always expect to see 100 objects
@@ -826,6 +960,8 @@ async fn test_state_handler_metrics_are_stable(pool: sqlx::PgPool) -> eyre::Resu
             start_time.elapsed().as_secs_f32()
         );
     }
+    cancel_token.cancel();
+    join_set.join_all().await;
 
     Ok(())
 }
@@ -869,8 +1005,15 @@ async fn test_state_change_emitter_emits_events_on_transitions(
     pool: sqlx::PgPool,
 ) -> eyre::Result<()> {
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     // Create a single test object in state A
     let mut txn = pool.begin().await?;
@@ -896,7 +1039,7 @@ async fn test_state_change_emitter_emits_events_on_transitions(
         .services(Arc::new(()))
         .state_handler(Arc::new(TestTransitionStateHandler))
         .state_change_emitter(emitter)
-        .build_for_manual_iterations()?;
+        .build_for_manual_iterations(cancel_token)?;
 
     // Run first iteration: A -> B
     controller.run_single_iteration().await;
@@ -932,8 +1075,15 @@ async fn test_state_change_emitter_emits_events_on_transitions(
 #[crate::sqlx_test]
 async fn test_state_controller_manual_enqueuing(pool: sqlx::PgPool) -> eyre::Result<()> {
     create_test_state_controller_tables(&pool).await;
-    let work_lock_manager_handle =
-        db::work_lock_manager::start(pool.clone(), Default::default()).await?;
+    let mut join_set = JoinSet::new();
+    let cancel_token = CancellationToken::new();
+    let work_lock_manager_handle = db::work_lock_manager::start(
+        &mut join_set,
+        pool.clone(),
+        Default::default(),
+        cancel_token.clone(),
+    )
+    .await?;
 
     // Create a single test object in state A
     let mut txn = pool.begin().await?;
@@ -951,7 +1101,7 @@ async fn test_state_controller_manual_enqueuing(pool: sqlx::PgPool) -> eyre::Res
         .processor_id(uuid::Uuid::new_v4().to_string())
         .services(Arc::new(()))
         .state_handler(Arc::new(TestTransitionStateHandler))
-        .build_for_manual_iterations()?;
+        .build_for_manual_iterations(cancel_token)?;
 
     // Transition A -> B, but no re-enqueuing
     controller.run_single_iteration_ext(false).await;

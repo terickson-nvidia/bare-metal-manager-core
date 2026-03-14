@@ -18,12 +18,14 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Display;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use carbide_network::sanitized_mac;
 use carbide_uuid::machine::MachineType;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::power_shelf::{PowerShelfIdSource, PowerShelfType};
@@ -34,13 +36,12 @@ use db::{
     self, DatabaseError, ObjectFilter, Transaction, machine, network_segment as db_network_segment,
     power_shelf as db_power_shelf, switch as db_switch,
 };
-use forge_network::sanitized_mac;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{StreamExt, TryFutureExt};
 use itertools::Itertools;
 use libredfish::model::oem::nvidia_dpu::NicMode;
 use librms::RmsApi;
-use librms::protos::rack_manager::NodeType as RmsNodeType;
+use librms::protos::rack_manager::{NewNodeInfo, NodeType as RmsNodeType};
 use mac_address::MacAddress;
 use model::expected_power_shelf::ExpectedPowerShelf;
 use model::expected_switch::ExpectedSwitch;
@@ -55,11 +56,13 @@ use model::site_explorer::{
 };
 use model::switch::{NewSwitch, SwitchConfig};
 use sqlx::PgPool;
-use tokio::sync::oneshot;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use version_compare::Cmp;
 
 use crate::cfg::file::{FirmwareConfig, SiteExplorerConfig};
+use crate::periodic_timer::PeriodicTimer;
 use crate::{CarbideError, CarbideResult};
 
 mod endpoint_explorer;
@@ -178,20 +181,25 @@ impl SiteExplorer {
     }
 
     /// Start the SiteExplorer and return a [sending channel](tokio::sync::oneshot::Sender) that will stop the SiteExplorer when dropped.
-    pub fn start(mut self) -> eyre::Result<oneshot::Sender<i32>> {
-        let (stop_sender, stop_receiver) = oneshot::channel();
-
+    pub fn start(
+        mut self,
+        join_set: &mut JoinSet<()>,
+        cancel_token: CancellationToken,
+    ) -> io::Result<()> {
         if self.enabled {
-            tokio::task::Builder::new()
+            join_set
+                .build_task()
                 .name("site_explorer")
-                .spawn(async move { self.run(stop_receiver).await })?;
+                .spawn(async move { self.run(cancel_token).await })?;
         }
 
-        Ok(stop_sender)
+        Ok(())
     }
 
-    async fn run(&mut self, mut stop_receiver: oneshot::Receiver<i32>) {
+    async fn run(&mut self, cancel_token: CancellationToken) {
+        let timer = PeriodicTimer::new(self.config.run_interval);
         loop {
+            let tick = timer.tick();
             match self.run_single_iteration().await {
                 Ok(identified_hosts) => self
                     .boot_order_tracker
@@ -202,8 +210,8 @@ impl SiteExplorer {
             }
 
             tokio::select! {
-                _ = tokio::time::sleep(self.config.run_interval) => {},
-                _ = &mut stop_receiver => {
+                _ = tick.sleep() => {},
+                _ = cancel_token.cancelled() => {
                     tracing::info!("SiteExplorer stop was requested");
                     return;
                 }
@@ -772,17 +780,20 @@ impl SiteExplorer {
         // Register the power shelf with Rack Manager if RMS client is available
         if let Some(rms_client) = &self.rms_client {
             if let Some(rack_id) = expected_shelf.rack_id {
-                if let Err(e) = rms::add_node_to_rms(
-                    rms_client.as_ref(),
-                    rack_id,
-                    power_shelf_id.to_string(),
-                    explored_endpoint.address.to_string(),
-                    443,
-                    expected_shelf.bmc_mac_address,
-                    RmsNodeType::Powershelf,
-                )
-                .await
-                {
+                let new_node_info = NewNodeInfo {
+                    rack_id: rack_id.to_string(),
+                    node_id: power_shelf_id.to_string(),
+                    mac_address: expected_shelf.bmc_mac_address.to_string(),
+                    ip_address: explored_endpoint.address.to_string(),
+                    port: 443,
+                    username: None,
+                    password: None,
+                    r#type: Some(RmsNodeType::Powershelf.into()),
+                    vault_path: String::new(),
+                    host_ip_addresses: vec![],
+                    host_mac_addresses: vec![],
+                };
+                if let Err(e) = rms::add_node_to_rms(rms_client.as_ref(), new_node_info).await {
                     tracing::warn!(
                         "Failed to add power shelf {} to Rack Manager: {}",
                         power_shelf_id,
@@ -816,6 +827,35 @@ impl SiteExplorer {
             .begin()
             .await
             .map_err(|e| DatabaseError::new("begin load create_switch", e))?;
+
+        let metadata = expected_switch.metadata.clone();
+
+        let Some(mac_address) = metadata.labels.get("host_mac_address") else {
+            return Err(CarbideError::InvalidArgument(format!(
+                "no host NVOS MAC address found for switch {}",
+                explored_endpoint.address
+            )));
+        };
+
+        let host_mac_address = MacAddress::try_from(mac_address.as_str())
+            .map_err(|e| CarbideError::InvalidArgument(format!("Invalid MAC address: {}", e)))?;
+
+        let interface =
+            db::machine_interface::find_by_mac_address(&mut txn, host_mac_address).await?;
+
+        let (host_nvos_mac_addresses, host_nvos_ip_addresses) =
+            if let Some(interface) = interface.first() {
+                (
+                    vec![mac_address.clone()],
+                    interface
+                        .addresses
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<String>>(),
+                )
+            } else {
+                (vec![], vec![])
+            };
 
         // Generate switch_id similar to machine_id using deterministic hashing
         // Extract switch metadata similar to how machine_id extracts hardware info
@@ -895,17 +935,21 @@ impl SiteExplorer {
         // Register the switch with Rack Manager if RMS client is available
         if let Some(rms_client) = &self.rms_client {
             if let Some(rack_id) = expected_switch.rack_id {
-                if let Err(e) = rms::add_node_to_rms(
-                    rms_client.as_ref(),
-                    rack_id,
-                    switch_id.to_string(),
-                    explored_endpoint.address.to_string(),
-                    443,
-                    expected_switch.bmc_mac_address,
-                    RmsNodeType::Switch,
-                )
-                .await
-                {
+                let bmc_mac_address = expected_switch.bmc_mac_address;
+                let new_node_info = NewNodeInfo {
+                    rack_id: rack_id.to_string(),
+                    node_id: switch_id.to_string(),
+                    mac_address: bmc_mac_address.to_string(),
+                    ip_address: explored_endpoint.address.to_string(),
+                    port: 443,
+                    username: None,
+                    password: None,
+                    r#type: Some(RmsNodeType::Switch.into()),
+                    vault_path: format!("switch_nvos/{bmc_mac_address}/admin"),
+                    host_ip_addresses: host_nvos_ip_addresses,
+                    host_mac_addresses: host_nvos_mac_addresses,
+                };
+                if let Err(e) = rms::add_node_to_rms(rms_client.as_ref(), new_node_info).await {
                     tracing::warn!("Failed to add switch {} to Rack Manager: {}", switch_id, e);
                 } else {
                     tracing::info!(
@@ -2663,27 +2707,11 @@ fn find_host_pf_mac_address(dpu_ep: &ExploredEndpoint) -> Result<MacAddress, Str
     // back to the legacy method via get_sys_image_version.
 
     // Try the explored computer-system base_mac first
-    if let Some(system_mac) = dpu_ep
-        .report
-        .systems
-        .first()
-        .and_then(|s| s.base_mac.clone())
-    {
-        // Once we've got some unsanitized MAC value,
-        // sanitize it (stripping out garbage like spaces, double quotes, etc),
-        // and return a sanitized MA:CA:DD:RE:SS as a MacAddress.
-        match sanitized_mac(&system_mac) {
-            Ok(mac) => return Ok(mac),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to sanitize ComputerSystem base_mac, falling back to legacy method: {} (source_mac: {})",
-                    e,
-                    system_mac
-                );
-            }
-        }
+    if let Some(system_mac) = dpu_ep.report.systems.first().and_then(|s| s.base_mac) {
+        return Ok(system_mac.to_mac());
     }
 
+    tracing::warn!("ComputerSystem doesn't have base_mac, falling back to legacy method");
     let legacy_mac = get_base_mac_from_sys_image_version(get_sys_image_version(
         dpu_ep.report.service.as_ref(),
     )?)?;

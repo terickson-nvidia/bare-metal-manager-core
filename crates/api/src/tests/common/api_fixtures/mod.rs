@@ -23,6 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use carbide_dpf::KubeImpl;
 use carbide_uuid::instance::InstanceId;
@@ -37,8 +38,9 @@ use db::network_security_group::create as create_network_security_group;
 use db::work_lock_manager;
 use dpu::DpuConfig;
 use forge_secrets::credentials::{
-    CredentialKey, CredentialProvider, CredentialType, Credentials, TestCredentialProvider,
+    CompositeCredentialManager, CredentialManager, CredentialReader, TestCredentialManager,
 };
+use forge_secrets::{ChainedCredentialReader, CredentialSnapshot, UsernamePassword};
 use futures::FutureExt as _;
 use health_report::{HealthReport, OverrideMode};
 use ipnetwork::IpNetwork;
@@ -74,20 +76,23 @@ use site_explorer::new_host_with_machine_validation;
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::Request;
 use tracing_subscriber::EnvFilter;
 
 use crate::api::Api;
 use crate::api::metrics::ApiMetricsEmitter;
 use crate::cfg::file::{
-    BomValidationConfig, CarbideConfig, DpaConfig, DpaInterfaceStateControllerConfig,
-    DpuConfig as InitialDpuConfig, FirmwareGlobal, FnnConfig, IBFabricConfig, IbFabricDefinition,
-    IbPartitionStateControllerConfig, ListenMode, MachineStateControllerConfig, MachineUpdater,
-    MachineValidationConfig, MeasuredBootMetricsCollectorConfig, NetworkSecurityGroupConfig,
+    BomValidationConfig, CarbideConfig, ComputeAllocationEnforcement, DpaConfig,
+    DpaInterfaceStateControllerConfig, DpuConfig as InitialDpuConfig, FirmwareGlobal, FnnConfig,
+    IBFabricConfig, IbFabricDefinition, IbPartitionStateControllerConfig, ListenMode,
+    MachineStateControllerConfig, MachineUpdater, MachineValidationConfig,
+    MeasuredBootMetricsCollectorConfig, MqttAuthConfig, NetworkSecurityGroupConfig,
     NetworkSegmentStateControllerConfig, NvLinkConfig, PowerManagerOptions,
-    PowerShelfStateControllerConfig, RackStateControllerConfig, SiteExplorerConfig, SpdmConfig,
-    SpdmStateControllerConfig, StateControllerConfig, SwitchStateControllerConfig, VmaasConfig,
-    VpcPeeringPolicy, default_max_find_by_ids,
+    PowerShelfStateControllerConfig, RackStateControllerConfig, SiteExplorerConfig,
+    SiteExplorerExploreMode, SpdmConfig, SpdmStateControllerConfig, StateControllerConfig,
+    SwitchStateControllerConfig, VmaasConfig, VpcPeeringPolicy, default_max_find_by_ids,
 };
 use crate::ethernet_virtualization::{EthVirtData, SiteFabricPrefixList};
 use crate::ib::{self, IBFabricManagerImpl, IBFabricManagerType};
@@ -95,6 +100,7 @@ use crate::ib_fabric_monitor::IbFabricMonitor;
 use crate::ipmitool::IPMIToolTestImpl;
 use crate::logging::level_filter::ActiveLevel;
 use crate::logging::log_limiter::LogLimiter;
+use crate::nv_redfish::NvRedfishClientPool;
 use crate::nvl_partition_monitor::NvlPartitionMonitor;
 use crate::nvlink::NmxmClientPool;
 use crate::nvlink::test_support::NmxmSimClient;
@@ -259,8 +265,10 @@ pub struct TestEnvOverrides {
     pub dpf_config: Option<DpfConfig>,
     pub fnn_config: Option<FnnConfig>,
     pub nmxm_default_partition: Option<bool>,
+    pub nmxm_unknown_partition: Option<bool>,
     // After n create_requests succeed, they will start failing.
     pub nmxm_fail_after_n_creates: Option<usize>,
+    pub compute_allocation_enforcement: Option<ComputeAllocationEnforcement>,
 }
 
 impl TestEnvOverrides {
@@ -306,6 +314,14 @@ impl TestEnvOverrides {
         self
     }
 
+    pub fn with_compute_allocation_enforcement(
+        mut self,
+        enforcement: ComputeAllocationEnforcement,
+    ) -> Self {
+        self.compute_allocation_enforcement = Some(enforcement);
+        self
+    }
+
     pub fn no_network_segments() -> Self {
         Self {
             create_network_segments: Some(false),
@@ -345,8 +361,11 @@ pub struct TestEnv {
     pub underlay_segment: Option<NetworkSegmentId>,
     pub domain: uuid::Uuid,
     pub nvl_partition_monitor: Arc<Mutex<NvlPartitionMonitor>>,
-    pub test_credential_provider: Arc<TestCredentialProvider>,
+    pub test_credential_manager: Arc<TestCredentialManager>,
     pub rms_sim: Arc<RmsSim>,
+    pub drop_guard: DropGuard,
+    // Background tasks are spawned here, hold it so they don't get dropped.
+    pub join_set: JoinSet<()>,
 }
 
 impl TestEnv {
@@ -1004,6 +1023,7 @@ pub fn get_config() -> CarbideConfig {
         alt_metric_prefix: None,
         database_url: "pgsql:://localhost".to_string(),
         max_database_connections: 1000,
+        compute_allocation_enforcement: Default::default(),
         asn: 0,
         datacenter_asn: 0,
         dhcp_servers: vec![],
@@ -1066,6 +1086,7 @@ pub fn get_config() -> CarbideConfig {
             dpu_up_threshold: Duration::weeks(52),
             controller: StateControllerConfig::default(),
             scout_reporting_timeout: Duration::weeks(52),
+            uefi_boot_wait: Duration::seconds(0),
         },
         network_segment_state_controller: NetworkSegmentStateControllerConfig {
             network_segment_drain_time: Duration::seconds(2),
@@ -1129,6 +1150,7 @@ pub fn get_config() -> CarbideConfig {
             hb_interval: Duration::minutes(2),
             subnet_ip: Ipv4Addr::UNSPECIFIED,
             subnet_mask: 0_i32,
+            auth: MqttAuthConfig::default(),
         }),
         power_manager_options: PowerManagerOptions {
             enabled: false,
@@ -1175,11 +1197,10 @@ async fn create_pool(current_pool: sqlx::PgPool) -> sqlx::PgPool {
         .get_database()
         .expect("No database is set initially.");
 
-    let db_url = format!("{db_url}/{db}");
-
     use sqlx::ConnectOptions;
     let connect_options = PgConnectOptions::from_str(&db_url)
         .unwrap()
+        .database(db)
         .log_statements("INFO".parse().unwrap());
 
     sqlx::postgres::PgPoolOptions::new()
@@ -1254,15 +1275,30 @@ pub async fn create_test_env_with_overrides(
     overrides: TestEnvOverrides,
 ) -> TestEnv {
     let db_pool = create_pool(db_pool).await;
+    let cancel_token = CancellationToken::new();
+    let mut join_set = JoinSet::new();
+
     let work_lock_manager_handle = work_lock_manager::start(
+        &mut join_set,
         db_pool.clone(),
         work_lock_manager::KeepaliveConfig::default(),
+        cancel_token.clone(),
     )
     .await
     .expect("work_lock_manager failed to start: no availble connections?");
+
     let test_meter = TestMeter::default();
-    let credential_provider = Arc::new(TestCredentialProvider::default());
-    populate_default_credentials(credential_provider.as_ref()).await;
+    let credential_manager = Arc::new(TestCredentialManager::default());
+
+    let chained_reader = ChainedCredentialReader::from(vec![
+        Box::new(test_static_credential_snapshot()) as Box<dyn CredentialReader>,
+        Box::new(credential_manager.clone()),
+    ]);
+    let composite_manager: Arc<dyn CredentialManager> = Arc::new(CompositeCredentialManager::new(
+        chained_reader,
+        credential_manager.clone(),
+    ));
+
     let certificate_provider = Arc::new(TestCertificateProvider::new());
     let redfish_sim = Arc::new(RedfishSim::default());
     let nmxm_sim: Arc<dyn NmxmClientPool> =
@@ -1270,6 +1306,8 @@ pub async fn create_test_env_with_overrides(
             NmxmSimClient::with_fail_after_n_creates(n)
         } else if overrides.nmxm_default_partition == Some(true) {
             NmxmSimClient::with_default_partition()
+        } else if overrides.nmxm_unknown_partition == Some(true) {
+            NmxmSimClient::with_unknown_partition()
         } else {
             NmxmSimClient::default()
         });
@@ -1290,11 +1328,14 @@ pub async fn create_test_env_with_overrides(
         Default::default()
     };
 
+    config.compute_allocation_enforcement =
+        overrides.compute_allocation_enforcement.unwrap_or_default();
+
     let config = Arc::new(config);
 
     let ib_config = config.ib_config.clone().unwrap_or_default();
     let ib_fabric_manager_impl = ib::create_ib_fabric_manager(
-        credential_provider.clone(),
+        composite_manager.clone(),
         ib::IBFabricManagerConfig {
             allow_insecure_fabric_configuration: ib_config.allow_insecure,
             endpoints: if ib_config.enabled {
@@ -1384,12 +1425,15 @@ pub async fn create_test_env_with_overrides(
     };
 
     let ipmi_tool = Arc::new(IPMIToolTestImpl {});
-
+    let bmc_proxy = Arc::new(ArcSwap::new(None.into()));
     let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
         redfish_sim.clone(),
+        Arc::new(NvRedfishClientPool::new(bmc_proxy)),
         ipmi_tool.clone(),
-        credential_provider.clone(),
+        composite_manager.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Tests use MockEndpointExplorer. So this doesn't affect anything.
+        SiteExplorerExploreMode::NvRedfish,
     ));
 
     let reachability_params = ReachabilityParams {
@@ -1397,6 +1441,7 @@ pub async fn create_test_env_with_overrides(
         power_down_wait: Duration::seconds(0),
         failure_retry_time: Duration::seconds(0),
         scout_reporting_timeout: config.machine_state_controller.scout_reporting_timeout,
+        uefi_boot_wait: Duration::seconds(0),
     };
 
     let rms_sim = Arc::new(RmsSim::default());
@@ -1404,7 +1449,7 @@ pub async fn create_test_env_with_overrides(
     let api = Arc::new(Api {
         kube_client_provider: Arc::new(TestDpfKubeClient {}),
         runtime_config: config.clone(),
-        credential_provider: credential_provider.clone(),
+        credential_manager: composite_manager,
         certificate_provider: certificate_provider.clone(),
         database_connection: db_pool.clone(),
         redfish_pool: redfish_sim.clone(),
@@ -1489,7 +1534,7 @@ pub async fn create_test_env_with_overrides(
         .io(Arc::new(MachineStateControllerIO {
             host_health: config.host_health,
         }))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build state controller");
 
     let spdm_controller = StateController::<SpdmStateControllerIO>::builder()
@@ -1499,7 +1544,7 @@ pub async fn create_test_env_with_overrides(
         .services(handler_services.clone())
         .state_handler(Arc::new(spdm_swap.clone()))
         .io(Arc::new(SpdmStateControllerIO {}))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build spdm state controller");
 
     let ib_swap = SwapHandler {
@@ -1512,7 +1557,7 @@ pub async fn create_test_env_with_overrides(
         .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(ib_swap.clone()))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build state controller");
 
     let network_swap = SwapHandler {
@@ -1531,7 +1576,7 @@ pub async fn create_test_env_with_overrides(
         .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(network_swap.clone()))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build state controller");
 
     let power_shelf_controller = StateController::builder()
@@ -1540,7 +1585,7 @@ pub async fn create_test_env_with_overrides(
         .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(PowerShelfStateHandler::default()))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build PowerShelfStateController");
 
     let switch_controller = StateController::builder()
@@ -1549,7 +1594,7 @@ pub async fn create_test_env_with_overrides(
         .processor_id(state_controller_id.clone())
         .services(handler_services.clone())
         .state_handler(Arc::new(SwitchStateHandler::default()))
-        .build_for_manual_iterations()
+        .build_for_manual_iterations(cancel_token.clone())
         .expect("Unable to build state controller");
 
     let fake_endpoint_explorer = MockEndpointExplorer {
@@ -1585,6 +1630,8 @@ pub async fn create_test_env_with_overrides(
             switches_created_per_run: 1,
             rotate_switch_nvos_credentials: Arc::new(false.into()),
             use_onboard_nic: Arc::new(false.into()),
+            // Tests use MockEndpointExplorer. So this doesn't affect anything.
+            explore_mode: SiteExplorerExploreMode::NvRedfish,
         },
         test_meter.meter(),
         Arc::new(fake_endpoint_explorer.clone()),
@@ -1676,8 +1723,10 @@ pub async fn create_test_env_with_overrides(
         underlay_segment,
         domain: domain.into(),
         nvl_partition_monitor: Arc::new(Mutex::new(nvl_partition_monitor)),
-        test_credential_provider: credential_provider.clone(),
+        test_credential_manager: credential_manager.clone(),
         rms_sim,
+        drop_guard: cancel_token.drop_guard(),
+        join_set,
     }
 }
 
@@ -1697,6 +1746,8 @@ pub async fn get_instance_type_fixture_id(env: &TestEnv) -> String {
         .find_instance_types_by_ids(tonic::Request::new(
             rpc::forge::FindInstanceTypesByIdsRequest {
                 instance_type_ids: existing_instance_type_ids,
+                include_allocation_stats: false,
+                tenant_organization_id: None,
             },
         ))
         .await
@@ -1818,43 +1869,22 @@ pub async fn populate_network_security_groups(api: Arc<Api>) {
     txn.commit().await.unwrap();
 }
 
-async fn populate_default_credentials(credential_provider: &dyn CredentialProvider) {
-    credential_provider
-        .set_credentials(
-            &CredentialKey::DpuRedfish {
-                credential_type: CredentialType::DpuHardwareDefault,
-            },
-            &Credentials::UsernamePassword {
-                username: "root".to_string(),
-                password: "dpuredfish_dpuhardwaredefault".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-    credential_provider
-        .set_credentials(
-            &CredentialKey::DpuRedfish {
-                credential_type: CredentialType::SiteDefault,
-            },
-            &Credentials::UsernamePassword {
-                username: "root".to_string(),
-                password: "dpuredfish_sitedefault".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-    credential_provider
-        .set_credentials(
-            &CredentialKey::HostRedfish {
-                credential_type: CredentialType::SiteDefault,
-            },
-            &Credentials::UsernamePassword {
-                username: "root".to_string(),
-                password: "hostredfish_sitedefault".to_string(),
-            },
-        )
-        .await
-        .unwrap();
+fn test_static_credential_snapshot() -> CredentialSnapshot {
+    CredentialSnapshot {
+        dpu_redfish_factory_default: Some(UsernamePassword {
+            username: "root".to_string(),
+            password: "dpuredfish_dpuhardwaredefault".to_string(),
+        }),
+        dpu_redfish_site_default: Some(UsernamePassword {
+            username: "root".to_string(),
+            password: "dpuredfish_sitedefault".to_string(),
+        }),
+        host_redfish_site_default: Some(UsernamePassword {
+            username: "root".to_string(),
+            password: "hostredfish_sitedefault".to_string(),
+        }),
+        ..Default::default()
+    }
 }
 
 fn pool_defs(fabric_len: u8) -> HashMap<String, resource_pool::ResourcePoolDef> {
@@ -2088,6 +2118,7 @@ pub async fn network_configured_with_health(
 
     let dpu_health = dpu_health.unwrap_or_else(|| rpc::health::HealthReport {
         source: "forge-dpu-agent".to_string(),
+        triggered_by: None,
         observed_at: None,
         successes: vec![],
         alerts: vec![],
@@ -2151,14 +2182,18 @@ pub async fn simulate_hardware_health_report(
     host_machine_id: &MachineId,
     health_report: health_report::HealthReport,
 ) {
-    use rpc::forge::HardwareHealthReport;
     use rpc::forge::forge_server::Forge;
+    use rpc::forge::{HealthReportOverride, InsertHealthReportOverrideRequest};
     use tonic::Request;
+
     let _ = env
         .api
-        .record_hardware_health_report(Request::new(HardwareHealthReport {
+        .insert_health_report_override(Request::new(InsertHealthReportOverrideRequest {
             machine_id: Some(*host_machine_id),
-            report: Some(health_report.into()),
+            r#override: Some(HealthReportOverride {
+                report: Some(health_report.into()),
+                ..Default::default()
+            }),
         }))
         .await
         .unwrap();

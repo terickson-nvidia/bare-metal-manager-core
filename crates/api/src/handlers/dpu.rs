@@ -21,12 +21,12 @@ use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::{common as rpc_common, forge as rpc};
+use carbide_network::virtualization::VpcVirtualizationType;
 use carbide_uuid::machine::MachineId;
 use db::{
     DatabaseError, ObjectColumnFilter, dpu_agent_upgrade_policy, network_security_group,
     network_segment,
 };
-use forge_network::virtualization::VpcVirtualizationType;
 use futures_util::future::join_all;
 use itertools::Itertools;
 use model::extension_service::{ExtensionService, ExtensionServiceVersionInfo};
@@ -575,7 +575,7 @@ pub(crate) async fn get_managed_host_network_config_inner(
                 info.version.version,
             );
             Some(
-                extension_service::get_extension_service_credential(&api.credential_provider, key)
+                extension_service::get_extension_service_credential(&api.credential_manager, key)
                     .await?,
             )
         } else {

@@ -31,9 +31,7 @@ use db::DatabaseError;
 use db::db_read::PgPoolReader;
 use db::machine::mark_machine_ingestion_done_with_dpf;
 use eyre::eyre;
-use forge_secrets::credentials::{
-    BmcCredentialType, CredentialKey, CredentialProvider, Credentials,
-};
+use forge_secrets::credentials::{BmcCredentialType, CredentialKey, CredentialReader, Credentials};
 use futures::TryFutureExt;
 use futures_util::FutureExt;
 use health_report::{
@@ -45,7 +43,7 @@ use libredfish::model::task::TaskState;
 use libredfish::model::update_service::TransferProtocolType;
 use libredfish::{Boot, EnabledDisabled, PowerState, Redfish, RedfishError, SystemPowerControl};
 use librms::RackManagerError;
-use librms::protos::rack_manager::NodeType as RmsNodeType;
+use librms::protos::rack_manager::{NewNodeInfo, NodeType as RmsNodeType};
 use machine_validation::{handle_machine_validation_requested, handle_machine_validation_state};
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
@@ -73,7 +71,7 @@ use model::machine::{
     ManagedHostStateSnapshot, MeasuringState, NetworkConfigUpdateState, NextStateBFBSupport,
     PerformPowerOperation, PowerDrainState, ReprovisionState, RetryInfo, SecureEraseBossContext,
     SecureEraseBossState, SetBootOrderInfo, SetBootOrderState, SetSecureBootState,
-    StateMachineArea, UefiSetupInfo, UefiSetupState, ValidationState,
+    StateMachineArea, UefiSetupInfo, UefiSetupState, UnlockHostState, ValidationState,
     dpf_based_dpu_provisioning_possible, get_display_ids,
 };
 use model::power_manager::PowerHandlingOutcome;
@@ -134,6 +132,7 @@ pub struct ReachabilityParams {
     pub power_down_wait: chrono::Duration,
     pub failure_retry_time: chrono::Duration,
     pub scout_reporting_timeout: chrono::Duration,
+    pub uefi_boot_wait: chrono::Duration,
 }
 
 /// Parameters used by the HostStateMachineHandler.
@@ -212,7 +211,7 @@ pub struct MachineStateHandlerBuilder {
     common_pools: Option<Arc<CommonPools>>,
     bom_validation: BomValidationConfig,
     instance_autoreboot_period: Option<TimePeriod>,
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    credential_reader: Option<Arc<dyn CredentialReader>>,
     power_options_config: PowerOptionConfig,
     enable_secure_boot: bool,
     hgx_bmc_gpu_reboot_delay: chrono::Duration,
@@ -231,6 +230,7 @@ impl MachineStateHandlerBuilder {
                 power_down_wait: chrono::Duration::zero(),
                 failure_retry_time: chrono::Duration::zero(),
                 scout_reporting_timeout: chrono::Duration::zero(),
+                uefi_boot_wait: chrono::Duration::zero(),
             },
             firmware_downloader: None,
             no_firmware_update_reset_retries: false,
@@ -243,7 +243,7 @@ impl MachineStateHandlerBuilder {
             common_pools: None,
             bom_validation: BomValidationConfig::default(),
             instance_autoreboot_period: None,
-            credential_provider: None,
+            credential_reader: None,
             power_options_config: PowerOptionConfig {
                 enabled: true,
                 next_try_duration_on_success: chrono::Duration::minutes(0),
@@ -264,8 +264,8 @@ impl MachineStateHandlerBuilder {
         self
     }
 
-    pub fn credential_provider(mut self, credential_provider: Arc<dyn CredentialProvider>) -> Self {
-        self.credential_provider = Some(credential_provider);
+    pub fn credential_reader(mut self, credential_reader: Arc<dyn CredentialReader>) -> Self {
+        self.credential_reader = Some(credential_reader);
         self
     }
     pub fn dpu_up_threshold(mut self, dpu_up_threshold: chrono::Duration) -> Self {
@@ -319,6 +319,11 @@ impl MachineStateHandlerBuilder {
 
     pub fn scout_reporting_timeout(mut self, scout_reporting_timeout: chrono::Duration) -> Self {
         self.reachability_params.scout_reporting_timeout = scout_reporting_timeout;
+        self
+    }
+
+    pub fn uefi_boot_wait(mut self, uefi_boot_wait: chrono::Duration) -> Self {
+        self.reachability_params.uefi_boot_wait = uefi_boot_wait;
         self
     }
 
@@ -394,7 +399,7 @@ impl MachineStateHandler {
             no_firmware_update_reset_retries: builder.no_firmware_update_reset_retries,
             instance_autoreboot_period: builder.instance_autoreboot_period,
             upgrade_script_state: Default::default(),
-            credential_provider: builder.credential_provider,
+            credential_reader: builder.credential_reader,
             async_firmware_uploader: Arc::new(Default::default()),
             hgx_bmc_gpu_reboot_delay: builder
                 .hgx_bmc_gpu_reboot_delay
@@ -852,17 +857,20 @@ impl MachineStateHandler {
                 // of an "already exists" error. However, the proto spec doesn't
                 // seem to define this, so once that's sorted, make sure to
                 // integrate that here.
-                match rms::add_node_to_rms(
-                    rms_client.as_ref(),
-                    rack_id,
-                    host_machine_id.to_string(),
-                    bmc_ip,
-                    443,
-                    bmc_mac.unwrap_or_default(),
-                    RmsNodeType::Compute,
-                )
-                .await
-                {
+                let new_node_info = NewNodeInfo {
+                    rack_id: rack_id.to_string(),
+                    node_id: host_machine_id.to_string(),
+                    mac_address: bmc_mac.unwrap_or_default().to_string(),
+                    ip_address: bmc_ip,
+                    port: 443,
+                    username: None,
+                    password: None,
+                    r#type: Some(RmsNodeType::Compute.into()),
+                    vault_path: String::new(),
+                    host_ip_addresses: vec![],
+                    host_mac_addresses: vec![],
+                };
+                match rms::add_node_to_rms(rms_client.as_ref(), new_node_info).await {
                     Ok(()) => {
                         tracing::info!(
                             machine_id = %host_machine_id,
@@ -5530,7 +5538,9 @@ impl StateHandler for InstanceStateHandler {
                             ManagedHostState::Assigned {
                                 instance_state: InstanceState::HostPlatformConfiguration {
                                     platform_config_state:
-                                        HostPlatformConfigurationState::CheckHostConfig,
+                                        HostPlatformConfigurationState::UnlockHost {
+                                            unlock_host_state: UnlockHostState::DisableLockdown,
+                                        },
                                 },
                             }
                         };
@@ -5837,6 +5847,7 @@ impl StateHandler for InstanceStateHandler {
                             // IB Monitor will unbind before clearing
                             let health_report = HealthReport {
                                 source: "ib-cleanup-validation".to_string(),
+                                triggered_by: None,
                                 observed_at: Some(chrono::Utc::now()),
                                 alerts: vec![HealthProbeAlert {
                                     id: HealthProbeId::from_str("IbCleanupPending")
@@ -6488,7 +6499,7 @@ struct HostUpgradeState {
     no_firmware_update_reset_retries: bool,
     instance_autoreboot_period: Option<TimePeriod>,
     upgrade_script_state: Arc<UpdateScriptManager>,
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    credential_reader: Option<Arc<dyn CredentialReader>>,
     async_firmware_uploader: Arc<AsyncFirmwareUploader>,
     hgx_bmc_gpu_reboot_delay: tokio::time::Duration,
 }
@@ -6922,7 +6933,7 @@ impl HostUpgradeState {
         let address = explored_endpoint.address.to_string().clone();
         let script = to_install.script.unwrap_or("/bin/false".into()); // Should always be Some at this point
         let upgrade_script_state = self.upgrade_script_state.clone();
-        let (username, password) = if let Some(credential_provider) = &self.credential_provider {
+        let (username, password) = if let Some(credential_reader) = &self.credential_reader {
             let bmc_mac_address =
                 state
                     .host_snapshot
@@ -6935,7 +6946,7 @@ impl HostUpgradeState {
             let key = CredentialKey::BmcCredentials {
                 credential_type: BmcCredentialType::BmcRoot { bmc_mac_address },
             };
-            match credential_provider.get_credentials(&key).await {
+            match credential_reader.get_credentials(&key).await {
                 Ok(Some(credentials)) => match credentials {
                     Credentials::UsernamePassword { username, password } => (username, password),
                 },
@@ -8879,6 +8890,7 @@ async fn call_machine_setup_and_handle_no_dpu_error(
             boot_interface_mac,
             &site_config.bios_profiles,
             site_config.selected_profile,
+            &HashMap::default(),
         )
         .await;
     match (
@@ -9017,7 +9029,6 @@ async fn log_host_config(redfish_client: &dyn Redfish, mh_snapshot: &ManagedHost
     );
 }
 
-#[allow(txn_held_across_await)]
 async fn handle_instance_host_platform_config(
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     mh_snapshot: &mut ManagedHostStateSnapshot,
@@ -9089,11 +9100,13 @@ async fn handle_instance_host_platform_config(
             }
 
             if power_state == PowerState::On {
-                // Host is already on, proceed to check config
+                // Host is on, unlock BMC before checking config so Redfish reflects reality
                 return Ok(StateHandlerOutcome::transition(
                     ManagedHostState::Assigned {
                         instance_state: InstanceState::HostPlatformConfiguration {
-                            platform_config_state: HostPlatformConfigurationState::CheckHostConfig,
+                            platform_config_state: HostPlatformConfigurationState::UnlockHost {
+                                unlock_host_state: UnlockHostState::DisableLockdown,
+                            },
                         },
                     },
                 ));
@@ -9116,10 +9129,88 @@ async fn handle_instance_host_platform_config(
                 mh_snapshot.host_snapshot.id, power_state
             )));
         }
+        HostPlatformConfigurationState::UnlockHost { unlock_host_state } => {
+            match unlock_host_state {
+                UnlockHostState::DisableLockdown => {
+                    redfish_client
+                        .lockdown_bmc(EnabledDisabled::Disabled)
+                        .await
+                        .map_err(|e| StateHandlerError::RedfishError {
+                            operation: "lockdown_bmc",
+                            error: e,
+                        })?;
+
+                    let vendor = mh_snapshot.host_snapshot.bmc_vendor();
+
+                    // Supermicro BMCs in lockdown mode sometimes report stale boot order
+                    // via Redfish (https://github.com/NVIDIA/bare-metal-manager-core/issues/505).
+                    // A reboot with lockdown disabled forces the BMC to re-read the actual UEFI
+                    // boot configuration.
+                    if vendor.is_supermicro() {
+                        tracing::info!(
+                            machine_id = %mh_snapshot.host_snapshot.id,
+                            %vendor,
+                            "BMC lockdown disabled; rebooting host so Redfish reflects actual boot order"
+                        );
+                        InstanceState::HostPlatformConfiguration {
+                            platform_config_state: HostPlatformConfigurationState::UnlockHost {
+                                unlock_host_state: UnlockHostState::RebootHost,
+                            },
+                        }
+                    } else {
+                        tracing::info!(
+                            machine_id = %mh_snapshot.host_snapshot.id,
+                            %vendor,
+                            "BMC lockdown disabled; skipping post-unlock reboot (not required for this vendor)"
+                        );
+                        InstanceState::HostPlatformConfiguration {
+                            platform_config_state: HostPlatformConfigurationState::CheckHostConfig,
+                        }
+                    }
+                }
+                UnlockHostState::RebootHost => {
+                    host_power_control(
+                        redfish_client.as_ref(),
+                        &mh_snapshot.host_snapshot,
+                        SystemPowerControl::ForceRestart,
+                        ctx,
+                    )
+                    .await
+                    .map_err(|e| {
+                        StateHandlerError::GenericError(eyre!(
+                            "failed to ForceRestart host after disabling BMC lockdown: {}",
+                            e
+                        ))
+                    })?;
+
+                    InstanceState::HostPlatformConfiguration {
+                        platform_config_state: HostPlatformConfigurationState::UnlockHost {
+                            unlock_host_state: UnlockHostState::WaitForUefiBoot,
+                        },
+                    }
+                }
+                UnlockHostState::WaitForUefiBoot => {
+                    let entered_at = mh_snapshot.host_snapshot.state.version.timestamp();
+                    if wait(&entered_at, reachability_params.uefi_boot_wait) {
+                        return Ok(StateHandlerOutcome::wait(format!(
+                            "Waiting for UEFI boot to complete on {} after post-unlock reboot; \
+                             wait duration: {}, will proceed after {}",
+                            mh_snapshot.host_snapshot.id,
+                            reachability_params.uefi_boot_wait,
+                            entered_at + reachability_params.uefi_boot_wait,
+                        )));
+                    }
+
+                    InstanceState::HostPlatformConfiguration {
+                        platform_config_state: HostPlatformConfigurationState::CheckHostConfig,
+                    }
+                }
+            }
+        }
         HostPlatformConfigurationState::CheckHostConfig => {
             let configure_host_boot_order = if !mh_snapshot.dpu_snapshots.is_empty() {
                 // Given that we are checking the boot order of a server immediately after a power cycle, we
-                // shoudl do some waiting to ensure that the host is not reporting stale redfish information from
+                // should do some waiting to ensure that the host is not reporting stale redfish information from
                 // before Carbide powered it off.
                 // This check guarantees that the host has finished loading the BIOS after the DPUs have come up.
                 // If Carbide is still reading an incorrect boot order at this point, something is wrong, and
@@ -9178,23 +9269,14 @@ async fn handle_instance_host_platform_config(
 
             if configure_host_boot_order {
                 InstanceState::HostPlatformConfiguration {
-                    platform_config_state: HostPlatformConfigurationState::UnlockHost,
+                    platform_config_state: HostPlatformConfigurationState::ConfigureBios,
                 }
             } else {
-                InstanceState::WaitingForDpusToUp
-            }
-        }
-        HostPlatformConfigurationState::UnlockHost => {
-            redfish_client
-                .lockdown_bmc(EnabledDisabled::Disabled)
-                .await
-                .map_err(|e| StateHandlerError::RedfishError {
-                    operation: "lockdown_bmc",
-                    error: e,
-                })?;
-
-            InstanceState::HostPlatformConfiguration {
-                platform_config_state: HostPlatformConfigurationState::ConfigureBios,
+                // Boot order is already correct (or no DPUs); skip to LockHost to
+                // re-enable BMC lockdown before proceeding.
+                InstanceState::HostPlatformConfiguration {
+                    platform_config_state: HostPlatformConfigurationState::LockHost,
+                }
             }
         }
         HostPlatformConfigurationState::ConfigureBios => {
@@ -9464,6 +9546,15 @@ async fn set_host_boot_order(
                                 )
                                 .await?
                             };
+
+                        // Log boot options and PCIe device list whenever a fresh reboot is
+                        // triggered so we capture full diagnostic context (UEFI device paths +
+                        // PCIe inventory) before state resets. Skipped when waiting on an
+                        // already-in-progress reboot to avoid redundant Redfish calls.
+                        if reboot_status.increase_retry_count {
+                            log_host_config(redfish_client, mh_snapshot).await;
+                        }
+
                         // Return wait instead of Err to ensure the transaction is committed
                         // and last_reboot_requested is persisted. Returning Err would cause a transaction
                         // rollback, leading to a tight reboot loop since the reboot timestamp is lost.
