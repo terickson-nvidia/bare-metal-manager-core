@@ -21,11 +21,7 @@ use carbide_uuid::machine::MachineId;
 
 use crate::duppet::{self, FileEnsure, SyncOptions};
 
-pub fn main_sync(
-    sync_options: SyncOptions,
-    machine_id: &MachineId,
-    host_machine_id: &MachineId,
-) {
+pub fn main_sync(sync_options: SyncOptions, machine_id: &MachineId, host_machine_id: &MachineId) {
     // Sync out all duppet-managed config files. This can be called as part of
     // main_loop running if we want (and can also be called willy nilly with
     // ad-hoc sets of files, including whenever the nvue config changes if we
@@ -69,9 +65,8 @@ pub fn main_sync(
         ),
         (
             "/run/otelcol-contrib/host-machine-id".into(),
-            duppet::FileSpec::new().with_content(
-                build_otel_host_machine_id_file_content(host_machine_id),
-            ),
+            duppet::FileSpec::new()
+                .with_content(build_otel_host_machine_id_file_content(host_machine_id)),
         ),
         // September 30, 2025.
         //

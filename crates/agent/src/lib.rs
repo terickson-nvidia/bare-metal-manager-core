@@ -246,7 +246,9 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 &periodic_config_fetcher,
                 Arc::clone(&forge_client_config),
                 &forge_api_server,
-            ).await {
+            )
+            .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     tracing::error!("get_host_machine_id_retry() failed: {:?}", e);

@@ -14,10 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use backon::{ExponentialBuilder, Retryable};
 use std::sync::Arc;
 use std::time::Duration;
 
+use backon::{ExponentialBuilder, Retryable};
 use carbide_host_support::agent_config::AgentConfig;
 use carbide_uuid::machine::{MachineId, MachineInterfaceId};
 use forge_dpu_agent_utils::utils::create_forge_client;
@@ -37,13 +37,11 @@ async fn get_interface(
 
     let mut interface_list = match client.find_interfaces(request).await {
         Ok(response) => Ok(response.into_inner()),
-        Err(err) => {
-            Err(eyre::eyre!(
-                "FindInterfaces gRPC request failed: interface_id={}, error={:?}",
-                interface_id,
-                err,
-            ))
-        }
+        Err(err) => Err(eyre::eyre!(
+            "FindInterfaces gRPC request failed: interface_id={}, error={:?}",
+            interface_id,
+            err,
+        )),
     }?;
 
     let len = interface_list.interfaces.len();
