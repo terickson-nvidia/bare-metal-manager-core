@@ -338,6 +338,12 @@ impl CertificateProvider for CertManagerCertificateProvider {
             .await
             .map_err(|error| SecretsError::GenericError(eyre::Report::new(error)))
     }
+
+    async fn sign_certificate(&self, _: &str, _: &str) -> Result<Certificate, SecretsError> {
+        Err(SecretsError::GenericError(eyre::eyre!(
+            "signing a caller-supplied CSR is not supported by the cert-manager provider"
+        )))
+    }
 }
 
 #[cfg(test)]

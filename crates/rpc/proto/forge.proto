@@ -270,6 +270,9 @@ service Forge {
   // PRIVILEGED: Creates a new machine from nothing
   rpc DiscoverMachine(MachineDiscoveryInfo) returns (MachineDiscoveryResult);
   rpc RenewMachineCertificate(MachineCertificateRenewRequest) returns (MachineCertificateResult);
+  // Returns the mTLS credentials a DPU uses to export telemetry to obs-gateway.
+  // The caller is identified by the client certificate on the TLS channel.
+  rpc GetObsGatewayCredentials(GetObsGatewayCredentialsRequest) returns (GetObsGatewayCredentialsResponse);
   rpc DiscoveryCompleted(MachineDiscoveryCompletedRequest) returns (MachineDiscoveryCompletedResponse);
   rpc CleanupMachineCompleted(MachineCleanupInfo) returns (MachineCleanupResult);
   // Invoked by forge-scout whenever a certain Machine can not be properly acted on
@@ -6524,6 +6527,36 @@ message MachineCertificateRenewRequest {
 message MachineCertificateResult {
   // the renewed certificate for the client that
   MachineCertificate machine_certificate = 1;
+}
+
+// The caller is identified via the TLS channel, which fixes the identity in the
+// issued certificate; nothing in this request can select or change it.
+message GetObsGatewayCredentialsRequest {
+  // PEM PKCS#10 certificate signing request. When set, the key pair is the
+  // caller's: the response carries no private key and the certificate binds
+  // the CSR's public key. Only the public key and the proof of possession are
+  // used; the CSR's subject and requested extensions are ignored.
+  // When unset, the server generates the key pair and returns the private key.
+  optional string csr_pem = 1;
+}
+
+// Failed with INVALID_ARGUMENT when csr_pem is malformed, and with INTERNAL when
+// the configured files cannot be read or the issued certificate cannot be
+// parsed. An issuer failure surfaces as the
+// certificate-issuance error of RenewMachineCertificate.
+message GetObsGatewayCredentialsResponse {
+  // PEM CA bundle for verifying the obs-gateway server certificate.
+  string ca_pem = 1;
+  // PEM client certificate, including any intermediates.
+  string client_cert_pem = 2;
+  // PEM private key for client_cert_pem. Sensitive: never log.
+  // Unset when the request carried a csr_pem and the certificate was issued
+  // for the caller's key. When set, use it even if a csr_pem was sent: a site
+  // serving shared static credentials cannot sign a CSR.
+  optional string client_key_pem = 3;
+  // Expiry of the leaf certificate in client_cert_pem. Callers use it to
+  // schedule the next fetch.
+  google.protobuf.Timestamp not_after = 4;
 }
 
 message MachineDiscoveryResult {

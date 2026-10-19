@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ::rpc::forge_tls_client::ForgeClientConfig;
-use carbide_host_support::agent_config::AgentConfig;
 use carbide_systemd::systemd;
 use forge_certs::cert_renewal::ClientCertRenewer;
 use forge_tls::client_config::ClientCert;
@@ -28,10 +27,12 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
 
 use crate::command_line;
+use crate::config::OtelAgentConfig;
+use crate::obs_credentials::ObsCredentialsRenewer;
 
 pub(super) async fn setup_and_run(
     forge_client_config: Arc<ForgeClientConfig>,
-    agent_config: AgentConfig,
+    agent_config: OtelAgentConfig,
     options: command_line::RunOptions,
 ) -> eyre::Result<()> {
     systemd::notify_start().await?;
@@ -47,9 +48,26 @@ pub(super) async fn setup_and_run(
     let client_cert_renewer =
         ClientCertRenewer::new(forge_api_server.clone(), Arc::clone(&forge_client_config));
 
+    // Unknown keys are ignored so deployed forge-dpu-agent config files keep
+    // loading, which means a misspelled `[obs-gateway]` table looks the same as
+    // an absent one. Just log at info, so the cause is findable.
+    if agent_config.obs_gateway.is_none() {
+        tracing::info!(
+            "No [obs-gateway] section in the config file; obs-gateway credentials will not be fetched"
+        );
+    }
+    let obs_credentials_renewer = agent_config.obs_gateway.clone().map(|obs_gateway| {
+        ObsCredentialsRenewer::new(
+            obs_gateway,
+            forge_api_server.clone(),
+            Arc::clone(&forge_client_config),
+        )
+    });
+
     let main_loop = MainLoop {
         agent_config,
         client_cert_renewer,
+        obs_credentials_renewer,
         started_at: start,
     };
 
@@ -57,8 +75,12 @@ pub(super) async fn setup_and_run(
 }
 
 struct MainLoop {
-    agent_config: AgentConfig,
+    agent_config: OtelAgentConfig,
+    /// Renews the NICo API client certificate.
     client_cert_renewer: ClientCertRenewer,
+    /// Keeps the obs-gateway credentials fresh. Absent when the config has no
+    /// `[obs-gateway]` section.
+    obs_credentials_renewer: Option<ObsCredentialsRenewer>,
     started_at: Instant,
 }
 
@@ -107,6 +129,12 @@ impl MainLoop {
         self.client_cert_renewer
             .renew_certificates_if_necessary(Some(certs))
             .await;
+
+        // Independent of the API certificate: a failure of one must not delay
+        // the other.
+        if let Some(renewer) = &mut self.obs_credentials_renewer {
+            renewer.fetch_if_necessary().await;
+        }
 
         let loop_period = Duration::from_secs(self.agent_config.period.main_loop_idle_secs);
 

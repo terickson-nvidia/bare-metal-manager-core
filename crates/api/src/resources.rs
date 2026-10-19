@@ -94,6 +94,17 @@ impl CertificateProvider for CertificateProviders {
             .get_certificate(unique_identifier, alt_names, ttl)
             .await
     }
+
+    async fn sign_certificate(
+        &self,
+        unique_identifier: &str,
+        csr_pem: &str,
+    ) -> Result<Certificate, SecretsError> {
+        // A CSR carries no DNS SANs, so it always takes the machine route.
+        self.machine
+            .sign_certificate(unique_identifier, csr_pem)
+            .await
+    }
 }
 
 pub(crate) async fn setup_resources(
@@ -950,6 +961,33 @@ mod tests {
                 ..Default::default()
             })
         }
+
+        async fn sign_certificate(
+            &self,
+            unique_identifier: &str,
+            csr_pem: &str,
+        ) -> Result<Certificate, SecretsError> {
+            assert_eq!(unique_identifier, "test-identifier");
+            Ok(Certificate {
+                public_key: self.0.as_bytes().to_vec(),
+                issuing_ca: csr_pem.as_bytes().to_vec(),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn certificate_providers_route_csr_requests_to_machine_provider() {
+        let provider = CertificateProviders {
+            machine: Arc::new(TestCertificateProvider("machine-provider")),
+            ufm: Arc::new(TestCertificateProvider("ufm-provider")),
+        };
+        let certificate = provider
+            .sign_certificate("test-identifier", "csr")
+            .await
+            .unwrap();
+        assert_eq!(certificate.public_key, b"machine-provider");
+        assert_eq!(certificate.issuing_ca, b"csr");
     }
 
     #[tokio::test]

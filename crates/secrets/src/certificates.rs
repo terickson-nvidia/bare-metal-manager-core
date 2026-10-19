@@ -32,6 +32,7 @@ pub fn machine_spiffe_uri(trust_domain: &str, machine_base_path: &str, machine_i
 #[derive(Debug, Clone, Default)]
 pub struct Certificate {
     pub issuing_ca: Vec<u8>,
+    /// Empty when the certificate was issued for a caller-supplied key.
     pub private_key: Vec<u8>,
     pub public_key: Vec<u8>,
 }
@@ -43,5 +44,15 @@ pub trait CertificateProvider: Send + Sync {
         unique_identifier: &str,
         alt_names: Option<String>,
         ttl: Option<String>,
+    ) -> Result<Certificate, SecretsError>;
+
+    /// Issues a certificate for the public key in `csr_pem`, a PEM PKCS#10
+    /// request, so the private key never reaches the provider. The identity in
+    /// the certificate comes from `unique_identifier`, as in `get_certificate`,
+    /// not from the CSR. The returned `private_key` is empty.
+    async fn sign_certificate(
+        &self,
+        unique_identifier: &str,
+        csr_pem: &str,
     ) -> Result<Certificate, SecretsError>;
 }

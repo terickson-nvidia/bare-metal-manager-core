@@ -31,7 +31,7 @@ use rand::RngExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use vaultrs::api::kv2::requests::SetSecretRequestOptions;
-use vaultrs::api::pki::requests::GenerateCertificateRequest;
+use vaultrs::api::pki::requests::{GenerateCertificateRequest, SignCertificateRequest};
 use vaultrs::client::{
     VaultClient, VaultClientSettings, VaultClientSettingsBuilder, VaultClientSettingsBuilderError,
 };
@@ -1023,6 +1023,15 @@ impl CredentialWriter for ForgeVaultClient {
 
 impl CredentialManager for ForgeVaultClient {}
 
+/// Baseline skew of between 60 - 100% of 30 days, so that not all boxes will
+/// renew (or expire) at the same time.
+fn default_certificate_ttl() -> String {
+    let max_hours = 720; // 24 * 30
+    let min_hours = 432; // 24 * 30 * 0.6
+    let mut rng = rand::rng();
+    format!("{}h", rng.random_range(min_hours..max_hours))
+}
+
 struct GetCertificateHelper {
     /// Used to form URI-type SANs for this certificate
     unique_identifier: String,
@@ -1051,16 +1060,7 @@ impl VaultTask<Certificate> for GetCertificateHelper {
             &self.unique_identifier,
         );
 
-        let ttl = if let Some(ttl) = self.ttl.clone() {
-            ttl
-        } else {
-            // this is to setup a baseline skew of between 60 - 100% of 30 days,
-            // so that not all boxes will renew (or expire) at the same time.
-            let max_hours = 720; // 24 * 30
-            let min_hours = 432; // 24 * 30 * 0.6
-            let mut rng = rand::rng();
-            format!("{}h", rng.random_range(min_hours..max_hours))
-        };
+        let ttl = self.ttl.clone().unwrap_or_else(default_certificate_ttl);
 
         let mut certificate_request_builder = GenerateCertificateRequest::builder();
         certificate_request_builder
@@ -1100,6 +1100,65 @@ impl VaultTask<Certificate> for GetCertificateHelper {
     }
 }
 
+struct SignCertificateHelper {
+    /// Becomes the common name and the URI SAN of this certificate, whatever
+    /// the CSR asks for.
+    unique_identifier: String,
+    pki_mount_location: String,
+    pki_role_name: String,
+    spiffe_trust_domain: String,
+    spiffe_machine_base_path: String,
+    csr_pem: String,
+}
+
+#[async_trait]
+impl VaultTask<Certificate> for SignCertificateHelper {
+    async fn execute(&self, vault_client: Arc<VaultClient>) -> Result<Certificate, SecretsError> {
+        emit(VaultRequestAttempted {
+            request_type: VaultRequestType::GetCertificate,
+        });
+
+        let spiffe_id = machine_spiffe_uri(
+            &self.spiffe_trust_domain,
+            &self.spiffe_machine_base_path,
+            &self.unique_identifier,
+        );
+        let ttl = default_certificate_ttl();
+
+        let mut certificate_request_builder = SignCertificateRequest::builder();
+        certificate_request_builder.uri_sans(spiffe_id).ttl(ttl);
+
+        let time_started_vault_request = Instant::now();
+        let vault_response = pki::cert::ca::sign(
+            vault_client.deref(),
+            self.pki_mount_location.as_str(),
+            self.pki_role_name.as_str(),
+            self.csr_pem.as_str(),
+            self.unique_identifier.as_str(),
+            Some(&mut certificate_request_builder),
+        )
+        .await;
+        emit(VaultRequestDuration {
+            request_type: VaultRequestType::GetCertificate,
+            duration_ms: time_started_vault_request.elapsed().as_millis() as u64,
+        });
+
+        let sign_certificate_response = vault_response.inspect_err(|err| {
+            record_vault_certificate_error(err);
+        })?;
+
+        emit(VaultRequestSucceeded {
+            request_type: VaultRequestType::GetCertificate,
+        });
+
+        Ok(Certificate {
+            issuing_ca: sign_certificate_response.issuing_ca.into_bytes(),
+            public_key: sign_certificate_response.certificate.into_bytes(),
+            private_key: Vec::new(),
+        })
+    }
+}
+
 #[async_trait]
 impl CertificateProvider for ForgeVaultClient {
     async fn get_certificate(
@@ -1119,6 +1178,23 @@ impl CertificateProvider for ForgeVaultClient {
         };
         let vault_client = self.vault_client().await?;
         get_certificate_helper.execute(vault_client).await
+    }
+
+    async fn sign_certificate(
+        &self,
+        unique_identifier: &str,
+        csr_pem: &str,
+    ) -> Result<Certificate, SecretsError> {
+        let sign_certificate_helper = SignCertificateHelper {
+            unique_identifier: unique_identifier.to_string(),
+            pki_mount_location: self.vault_client_config.pki_mount_location.clone(),
+            pki_role_name: self.vault_client_config.pki_role_name.clone(),
+            spiffe_trust_domain: self.vault_client_config.spiffe_trust_domain.clone(),
+            spiffe_machine_base_path: self.vault_client_config.spiffe_machine_base_path.clone(),
+            csr_pem: csr_pem.to_string(),
+        };
+        let vault_client = self.vault_client().await?;
+        sign_certificate_helper.execute(vault_client).await
     }
 }
 

@@ -1026,6 +1026,52 @@ pub struct CarbideConfig {
     /// production.
     #[serde(default)]
     pub panic_on_early_task_return: bool,
+
+    /// Files holding the mTLS credentials DPUs use to export telemetry to
+    /// obs-gateway, served by `GetObsGatewayCredentials`. Absent means the site
+    /// has none to serve and the RPC fails with `FAILED_PRECONDITION`. Read on
+    /// each call, so a rotated file is served without a restart.
+
+    /// How `GetObsGatewayCredentials` obtains the mTLS credentials DPUs use to
+    /// export telemetry to obs-gateway. Defaults to issuing each DPU its own
+    /// certificate from the site's certificate provider.
+    #[serde(default)]
+    pub obs_gateway_credentials: ObsGatewayCredentialSource,
+}
+
+/// `[obs_gateway_credentials]` config section: where the obs-gateway client
+/// credentials come from. Each variant only accepts the fields that belong to it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObsGatewayCredentialSource {
+    /// Issue each DPU its own certificate from the site's certificate provider,
+    /// the same CA that issues its NICo API certificate.
+    // A struct variant, unlike a unit variant, rejects stray fields.
+    SiteCa {},
+    /// Serve the same operator-supplied PEM files to every DPU. Read on each
+    /// call, so a rotated file is served without a restart.
+    StaticFiles(ObsGatewayCredentialsConfig),
+}
+
+impl Default for ObsGatewayCredentialSource {
+    fn default() -> Self {
+        Self::SiteCa {}
+    }
+}
+
+/// PEM files, typically a mounted cert-manager Secret, holding the obs-gateway
+/// client credentials for `type = "static_files"`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObsGatewayCredentialsConfig {
+    /// PEM CA bundle DPUs use to verify the obs-gateway server certificate.
+    pub ca_file: PathBuf,
+
+    /// PEM client certificate, leaf first, followed by any intermediates.
+    pub client_cert_file: PathBuf,
+
+    /// PEM private key for `client_cert_file`.
+    pub client_key_file: PathBuf,
 }
 
 /// Global admission limits for business requests handled by nico-api.
@@ -5299,6 +5345,35 @@ mod tests {
         let error = toml::from_str::<NodeAuthConfig>("audience = \"nico-api-eu\"")
             .expect_err("the node-auth audience is fixed");
         assert!(error.to_string().contains("unknown field `audience`"));
+    }
+
+    /// The tag selects the method, `site_ca` needs no fields, and each variant
+    /// rejects the other's fields.
+    #[test]
+    fn obs_gateway_credential_source_contract() {
+        let files = r#"type = "static_files"
+            ca_file = "/ca.pem"
+            client_cert_file = "/cert.pem"
+            client_key_file = "/key.pem""#;
+        let parse = |config: &str| toml::from_str::<ObsGatewayCredentialSource>(config).ok();
+
+        assert_eq!(
+            parse("type = \"site_ca\""),
+            Some(ObsGatewayCredentialSource::SiteCa {})
+        );
+        assert!(matches!(
+            parse(files),
+            Some(ObsGatewayCredentialSource::StaticFiles(_))
+        ));
+        assert_eq!(parse("type = \"site_ca\"\nca_file = \"/ca.pem\""), None);
+        assert_eq!(
+            parse("type = \"static_files\"\nca_file = \"/ca.pem\""),
+            None
+        );
+        assert_eq!(
+            ObsGatewayCredentialSource::default(),
+            ObsGatewayCredentialSource::SiteCa {}
+        );
     }
 
     #[test]

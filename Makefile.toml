@@ -293,6 +293,26 @@ docker run --rm \
   cargo ${CARGO_ARGS}
 '''
 
+[tasks.carbide-lints-docker]
+category = "CI"
+description = "Run carbide-lints inside the carbide-build-x86_64 Docker container, for hosts whose Kea headers are older than carbide-dhcp requires. Requires build-cargo-docker-image first and a Linux host, since the lint driver installed by setup-carbide-lints is built on the host and run in the container."
+workspace = false
+dependencies = ["check-cargo-home-set", "setup-carbide-lints"]
+script = '''
+set -e
+if [ -z "$CARGO_HOME" ]; then CARGO_HOME="$HOME/.cargo"; fi
+# Name the nightly toolchain: the stable cargo's library path would leave the
+# lint driver unable to load the nightly compiler's librustc_driver.
+docker run --rm \
+  -v "${REPO_ROOT}":/code \
+  -v "${CARGO_HOME}":/cargo \
+  -w /code \
+  -u $(id -u):$(id -g) \
+  -e CARGO_HOME=/cargo \
+  carbide-build-x86_64 \
+  cargo +${RUST_NIGHTLY} carbide-lints
+'''
+
 [tasks.test-dhcp-docker]
 category = "Test"
 description = "Run DHCP integration tests in the pinned Bookworm/Kea build environment."
@@ -616,6 +636,43 @@ dependencies = [
   "generate-rest-core-proto",
   "clippy-flow",
   "carbide-lints",
+  "lint-error-messages",
+  "check-format-nightly",
+  "check-event-names",
+  "check-workspace-deps",
+  "check-metric-docs",
+  "check-licenses",
+  "check-bans",
+]
+
+[tasks.clippy-excluding-dhcp]
+workspace = false
+description = "Runs clippy like the clippy task, but skips carbide-dhcp, whose build needs the Kea headers that only the build container has."
+category = "Test"
+dependencies = ["install-clippy"]
+command = "cargo"
+args = [
+  "clippy",
+  "--locked",
+  "--workspace",
+  "--exclude",
+  "carbide-dhcp",
+  "--all-targets",
+  "--all-features",
+  "--",
+  "-D",
+  "warnings",
+]
+
+[tasks.pre-commit-verify-workspace-docker]
+workspace = false
+description = "pre-commit-verify-workspace for a host whose Kea headers are too old to build carbide-dhcp: carbide-lints runs in the build container and clippy skips carbide-dhcp, which therefore goes unlinted. Requires build-cargo-docker-image first."
+category = "CI"
+# Keep in step with the dependencies of pre-commit-verify-workspace, which CI uses.
+dependencies = [
+  "generate-rest-core-proto",
+  "clippy-excluding-dhcp",
+  "carbide-lints-docker",
   "lint-error-messages",
   "check-format-nightly",
   "check-event-names",

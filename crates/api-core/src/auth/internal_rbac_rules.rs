@@ -259,6 +259,7 @@ impl InternalRBACRules {
         x.perm("ForgeAgentControl", vec![Machineatron, Scout]);
         x.perm("DiscoverMachine", vec![Anonymous]);
         x.perm("RenewMachineCertificate", vec![Agent]);
+        x.perm("GetObsGatewayCredentials", vec![Agent]);
         x.perm("DiscoveryCompleted", vec![Machineatron, Scout]);
         x.perm("CleanupMachineCompleted", vec![Machineatron, Scout]);
         x.perm("ReportForgeScoutError", vec![Anonymous]);
@@ -1693,6 +1694,16 @@ mod rbac_rule_tests {
         assert!(InternalRBACRules::allowed_from_static(
             "ReportForgeScoutError",
             &[]
+        ));
+        // The obs-gateway key is only for a DPU's own agent, not for other
+        // machine-side services.
+        assert!(InternalRBACRules::allowed_from_static(
+            "GetObsGatewayCredentials",
+            &[Principal::SpiffeMachineIdentifier("foo".to_string())]
+        ));
+        assert!(!InternalRBACRules::allowed_from_static(
+            "GetObsGatewayCredentials",
+            &[Principal::SpiffeServiceIdentifier("nico-pxe".to_string())]
         ));
         assert!(InternalRBACRules::allowed_from_static(
             "GetCloudInitInstructions",

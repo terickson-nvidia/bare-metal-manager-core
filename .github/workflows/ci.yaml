@@ -2165,6 +2165,7 @@ jobs:
           registry-password: ${{ secrets.NVCR_TOKEN }}
           charts: >-
             bluefield/charts/nico-dpu-agent
+            bluefield/charts/nico-dpu-otel-agent
             bluefield/charts/nico-fmds
             bluefield/charts/nico-otelcol
             helm
@@ -2526,6 +2527,13 @@ jobs:
         uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-validate@94bde998f5d7965576b0c663db7d5d709c918167
         with:
           chart-path: bluefield/charts/nico-dpu-agent
+          lint: 'true'
+          template: 'true'
+
+      - name: Validate nico-dpu-otel-agent chart
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-validate@94bde998f5d7965576b0c663db7d5d709c918167
+        with:
+          chart-path: bluefield/charts/nico-dpu-otel-agent
           lint: 'true'
           template: 'true'
 

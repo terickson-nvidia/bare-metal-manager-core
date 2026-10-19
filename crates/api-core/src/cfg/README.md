@@ -152,6 +152,7 @@ behavior.
 | `credentials` | `CredentialsConfig` | *(default)* | `security` | Operator-managed static credential sources and the UFM read/mutation policy (see [CredentialsConfig](#credentialsconfig)). The config stores source locations, not credential values. |
 | `dhcp_lease_expiry_handling` | `bool` | `false` | `networking` | Enables IP cleanup when a DHCP lease expires. |
 | `certificates` | `CertificatesConfig` | *(default)* | `security` | Certificate vending backend, selected independently of the credential store; the default shares the credential Vault (see [CertificatesConfig](#certificatesconfig)). |
+| `obs_gateway_credentials` | `ObsGatewayCredentialSource` | `{ type = "site_ca" }` | `security` | How `GetObsGatewayCredentials` obtains the mTLS credentials DPUs use to export telemetry to obs-gateway (see [ObsGatewayCredentialSource](#obsgatewaycredentialsource)). |
 | `allow_insecure_discovery` | `bool` | `false` | `machines` | Allows machines to submit discovery without enforcing the request comes from the expected IP address. Needed for *Integration tests only*, should otherwise not be used. |
 | `scout_boot_interface_correction_enabled` | `bool` | `false` | `machines` | Controls whether NICo may reconcile a boot interface selection recorded as `RedfishChassisId` or `RedfishSerialNumber` after ordering DPU-attached Admin interfaces by the `domain:bus:device.function` PCI addresses in scout's `HardwareInfo`. The setting is read at startup. NICo records available comparisons in structured logs and `carbide_scout_pci_evaluations_total` regardless of this setting. When `false`, it does not change the selection. When `true`, reconciliation requires at least two eligible interfaces, a complete and unique candidate, `ManagedHostState::Ready` or `ManagedHostState::HostInit` with `MachineState::Discovered`, no `Instance` or primary interface prediction, and no conflicting or integrated-NIC primary. If the selected MAC is already desired and primary, NICo changes only the source to `ScoutReportPci`. Otherwise it updates the desired target and primary together and enqueues the state handler. A `Ready` host enters `BootConfiguring`; `HostInit` completes its reboot handshake first. |
 | `node_auth` | `NodeAuthConfig` | *(default)* | `security` | How Scout and the DPU-agent authenticate: bearer JWTs, machine mTLS client certificates, or both during a migration (see [NodeAuthConfig](#nodeauthconfig)). |
@@ -1981,6 +1982,25 @@ label for filtering by machine; UFM requests instead use the
 they do not fall back to Vault. Provider selection does not change service
 transport Certificate resources, Secrets, or mounts. Vault credential and KMS
 backends remain independently configured.
+
+### `ObsGatewayCredentialSource`
+
+Tagged by `type`; each variant only accepts its own fields and unknown fields are rejected.
+
+| `type` | Fields | Description |
+|--------|--------|-------------|
+| `site_ca` (default) | — | Issues each DPU its own certificate from the site's certificate provider, the same CA that issues its NICo API certificate. With a `csr_pem` in the request the DPU keeps its private key and the response carries none; without one the provider generates the key pair and the response includes the private key. |
+| `static_files` | `ca_file`, `client_cert_file`, `client_key_file` | Serves one shared set of credentials to every DPU, for sites whose obs-gateway does not accept site CA certificates (see [ObsGatewayCredentialsConfig](#obsgatewaycredentialsconfig)). |
+
+### `ObsGatewayCredentialsConfig`
+
+Fields of `type = "static_files"`. Serves one shared set of credentials to every DPU instead of issuing per-DPU certificates, so a `csr_pem` in the request is ignored and the response always carries the private key. Read on every `GetObsGatewayCredentials` call, so a rotated file is served without a restart. The files must be readable by nico-api; an unreadable file fails the call with `INTERNAL`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ca_file` | `PathBuf` | **required** | PEM CA bundle DPUs use to verify the obs-gateway server certificate. |
+| `client_cert_file` | `PathBuf` | **required** | PEM client certificate, leaf first, followed by any intermediates. The first certificate's expiry is returned as `not_after`. |
+| `client_key_file` | `PathBuf` | **required** | PEM private key for `client_cert_file`. |
 
 ### `DedicatedVaultSettings`
 

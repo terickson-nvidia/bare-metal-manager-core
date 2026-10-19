@@ -2001,6 +2001,7 @@ dependencies = [
  "carbide-host-support",
  "carbide-rpc",
  "carbide-systemd",
+ "carbide-test-support",
  "carbide-tls",
  "clap",
  "ctor",
@@ -2008,16 +2009,20 @@ dependencies = [
  "humantime",
  "prost",
  "rand 0.10.1",
+ "rcgen",
  "reqwest 0.13.4",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tonic",
  "tracing",
  "tracing-subscriber",
  "typed-builder",
+ "x509-parser",
 ]
 
 [[package]]
