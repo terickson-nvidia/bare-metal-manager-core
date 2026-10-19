@@ -18,22 +18,27 @@
 use std::sync::Arc;
 
 use ::rpc::forge_tls_client::ForgeClientConfig;
-use carbide_host_support::agent_config::AgentConfig;
 pub use command_line::{AgentCommand, Options, RunOptions};
 use eyre::WrapErr;
 use forge_tls::client_config::ClientCert;
 
+use crate::config::OtelAgentConfig;
+
 mod command_line;
 
+mod config;
+
 mod main_loop;
+
+mod obs_credentials;
 
 pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
     let (agent, path) = match cmdline.config_path {
         // normal production case
-        None => (AgentConfig::default(), "default".to_string()),
+        None => (OtelAgentConfig::default(), "default".to_string()),
         // development overrides
         Some(config_path) => (
-            AgentConfig::load_from(&config_path).wrap_err(format!(
+            OtelAgentConfig::load_from(&config_path).wrap_err(format!(
                 "error loading agent configuration from {}",
                 config_path.display()
             ))?,

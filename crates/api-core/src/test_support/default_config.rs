@@ -388,6 +388,7 @@ pub fn get() -> CarbideConfig {
         certificates: Default::default(),
         shutdown_timeout: default_shutdown_timeout(),
         panic_on_early_task_return: true,
+        obs_gateway_credentials: Default::default(),
     }
 }
 

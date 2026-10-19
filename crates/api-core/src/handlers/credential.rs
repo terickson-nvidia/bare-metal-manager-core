@@ -18,11 +18,13 @@
 use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::forge::{self as rpc};
 use carbide_nvlink_manager::DEFAULT_NMX_M_NAME;
 use carbide_secrets::SecretsError;
+use carbide_secrets::certificates::CertificateProvider;
 use carbide_secrets::credentials::{
     BgpCredentialType, BmcCredentialType, CredentialKey, CredentialReader, CredentialType,
     Credentials, NicLockdownIkm,
@@ -32,9 +34,11 @@ use mac_address::MacAddress;
 use model::ConfigValidationError;
 use model::ib::DEFAULT_IB_FABRIC_NAME;
 use tonic::{Request, Response, Status};
+use x509_parser::prelude::{FromDer, X509Certificate, X509CertificationRequest};
 
 use crate::CarbideError;
 use crate::api::Api;
+use crate::cfg::file::{ObsGatewayCredentialSource, ObsGatewayCredentialsConfig};
 use crate::credentials::UpdateCredentials;
 use crate::handlers::utils::convert_and_log_machine_id;
 
@@ -865,6 +869,117 @@ pub(crate) async fn renew_machine_certificate(
     Err(CarbideError::ClientCertificateError("no client certificate presented?".to_string()).into())
 }
 
+pub(crate) async fn get_obs_gateway_credentials(
+    api: &Api,
+    request: Request<rpc::GetObsGatewayCredentialsRequest>,
+) -> Result<Response<rpc::GetObsGatewayCredentialsResponse>, Status> {
+    // Credentials are sensitive: do not log request or response data.
+    // The identity comes from the TLS channel, never from the request.
+    let machine_id = crate::auth::authenticated_machine_id(&request)?.ok_or_else(|| {
+        CarbideError::ClientCertificateError("no client certificate presented?".into())
+    })?;
+    let request = request.into_inner();
+
+    // Static files exist for sites whose obs-gateway does not accept
+    // certificates from the site CA.
+    let response = match &api.runtime_config.obs_gateway_credentials {
+        ObsGatewayCredentialSource::StaticFiles(config) => {
+            read_obs_gateway_credentials(config).await?
+        }
+        ObsGatewayCredentialSource::SiteCa {} => {
+            issue_site_ca_credentials(
+                api.certificate_provider.as_ref(),
+                &machine_id.to_string(),
+                request.csr_pem.as_deref(),
+            )
+            .await?
+        }
+    };
+    Ok(Response::new(response))
+}
+
+/// Issues credentials for `machine_id` from the same CA that issues its NICo API
+/// certificate, so a site without a dedicated obs-gateway can keep exporting to
+/// a receiver that trusts the site CA. With a CSR the private key stays with
+/// the caller; without one the provider generates it.
+async fn issue_site_ca_credentials(
+    provider: &dyn CertificateProvider,
+    machine_id: &str,
+    csr_pem: Option<&str>,
+) -> Result<rpc::GetObsGatewayCredentialsResponse, CarbideError> {
+    let certificate = match csr_pem {
+        Some(csr_pem) => {
+            validate_csr(csr_pem)?;
+            provider.sign_certificate(machine_id, csr_pem).await
+        }
+        None => provider.get_certificate(machine_id, None, None).await,
+    }
+    .map_err(|err| CarbideError::ClientCertificateError(err.to_string()))?;
+
+    let pem = |name: &str, bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|e| CarbideError::internal(format!("{name} is not valid PEM text: {e}")))
+    };
+    let client_cert_pem = pem("client certificate", certificate.public_key)?;
+    let not_after = leaf_not_after(&client_cert_pem)?;
+    let client_key_pem =
+        Some(pem("client key", certificate.private_key)?).filter(|k| !k.is_empty());
+
+    Ok(rpc::GetObsGatewayCredentialsResponse {
+        ca_pem: pem("issuing CA", certificate.issuing_ca)?,
+        client_cert_pem,
+        client_key_pem,
+        not_after: Some(not_after),
+    })
+}
+
+/// Rejects a CSR that is not a well-formed PEM PKCS#10 request or whose
+/// signature does not verify, so the caller proves it holds the private key.
+fn validate_csr(csr_pem: &str) -> Result<(), CarbideError> {
+    let invalid =
+        |e: &dyn std::fmt::Display| CarbideError::InvalidArgument(format!("csr_pem: {e}"));
+    let (_, pem) = x509_parser::pem::parse_x509_pem(csr_pem.as_bytes()).map_err(|e| invalid(&e))?;
+    let (_, csr) = X509CertificationRequest::from_der(&pem.contents).map_err(|e| invalid(&e))?;
+    csr.verify_signature().map_err(|e| invalid(&e))
+}
+
+/// Reads the files named by `config`. Separate from the handler so it can run
+/// without an `Api`.
+async fn read_obs_gateway_credentials(
+    config: &ObsGatewayCredentialsConfig,
+) -> Result<rpc::GetObsGatewayCredentialsResponse, CarbideError> {
+    async fn read(path: &Path) -> Result<String, CarbideError> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| CarbideError::internal(format!("read {}: {e}", path.display())))
+    }
+
+    let ca_pem = read(&config.ca_file).await?;
+    let client_cert_pem = read(&config.client_cert_file).await?;
+    let client_key_pem = read(&config.client_key_file).await?;
+    let not_after = leaf_not_after(&client_cert_pem)?;
+
+    Ok(rpc::GetObsGatewayCredentialsResponse {
+        ca_pem,
+        client_cert_pem,
+        client_key_pem: Some(client_key_pem),
+        not_after: Some(not_after),
+    })
+}
+
+/// Expiry of the first certificate in `cert_pem`, the leaf by convention.
+fn leaf_not_after(cert_pem: &str) -> Result<::rpc::Timestamp, CarbideError> {
+    let der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .next()
+        .ok_or_else(|| CarbideError::internal("client certificate PEM has no certificate".into()))?
+        .map_err(|e| CarbideError::internal(format!("parse client certificate PEM: {e}")))?;
+    let (_, cert) = X509Certificate::from_der(&der)
+        .map_err(|e| CarbideError::internal(format!("parse client certificate: {e}")))?;
+    let not_after = chrono::DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| CarbideError::internal("client certificate expiry out of range".into()))?;
+    Ok(not_after.into())
+}
+
 pub(crate) async fn get_container_registry_credential(
     api: &Api,
     request: Request<rpc::GetContainerRegistryCredentialRequest>,
@@ -919,4 +1034,140 @@ pub(crate) async fn set_container_registry_credential(
         .await
         .map_err(|e| CarbideError::internal(format!("set registry credential: {e:?}")))?;
     Ok(Response::new(()))
+}
+
+#[cfg(test)]
+mod obs_gateway_credentials_tests {
+    use super::*;
+
+    const CA_PEM: &str = "ca bundle\n";
+    const KEY_PEM: &str = "key material\n";
+
+    type BreakFiles = fn(&ObsGatewayCredentialsConfig);
+
+    fn cert_pem_expiring(year: i32) -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params.not_after = rcgen::date_time_ymd(year, 1, 2);
+        params
+            .self_signed(&rcgen::KeyPair::generate().expect("test key generates"))
+            .expect("test cert signs")
+            .pem()
+    }
+
+    fn write_files(dir: &Path, cert_pem: &str) -> ObsGatewayCredentialsConfig {
+        let config = ObsGatewayCredentialsConfig {
+            ca_file: dir.join("ca.pem"),
+            client_cert_file: dir.join("tls.crt"),
+            client_key_file: dir.join("tls.key"),
+        };
+        std::fs::write(&config.ca_file, CA_PEM).unwrap();
+        std::fs::write(&config.client_cert_file, cert_pem).unwrap();
+        std::fs::write(&config.client_key_file, KEY_PEM).unwrap();
+        config
+    }
+
+    /// The response carries the files verbatim, with the leaf's expiry as
+    /// `not_after`.
+    #[tokio::test]
+    async fn returns_files_and_leaf_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_pem = cert_pem_expiring(2030);
+        let config = write_files(dir.path(), &cert_pem);
+
+        let response = read_obs_gateway_credentials(&config).await.unwrap();
+
+        assert_eq!(response.ca_pem, CA_PEM);
+        assert_eq!(response.client_cert_pem, cert_pem);
+        assert_eq!(response.client_key_pem.as_deref(), Some(KEY_PEM));
+        // 2030-01-02T00:00:00Z
+        assert_eq!(response.not_after.unwrap().seconds, 1_893_542_400);
+    }
+
+    /// Each failure surfaces as an error instead of a partial response.
+    #[tokio::test]
+    async fn fails_on_unreadable_or_unparseable_files() {
+        let cases: [(&str, BreakFiles); 3] = [
+            ("missing ca file", |c| {
+                std::fs::remove_file(&c.ca_file).unwrap()
+            }),
+            ("missing key file", |c| {
+                std::fs::remove_file(&c.client_key_file).unwrap()
+            }),
+            ("cert file without a certificate", |c| {
+                std::fs::write(&c.client_cert_file, "not pem").unwrap()
+            }),
+        ];
+        for (scenario, break_files) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_files(dir.path(), &cert_pem_expiring(2030));
+            break_files(&config);
+
+            let result = read_obs_gateway_credentials(&config).await;
+
+            assert!(result.is_err(), "{scenario}: expected an error");
+        }
+    }
+
+    fn csr_pem() -> String {
+        rcgen::CertificateParams::default()
+            .serialize_request(&rcgen::KeyPair::generate().expect("test key generates"))
+            .expect("test csr signs")
+            .pem()
+            .expect("test csr encodes")
+    }
+
+    fn provider_issuing(
+        cert_pem: String,
+        key_pem: &str,
+    ) -> carbide_secrets::test_support::certificates::TestCertificateProvider {
+        let provider = carbide_secrets::test_support::certificates::TestCertificateProvider::new();
+        provider.certificates.try_lock().unwrap().insert(
+            "machine-1".to_string(),
+            carbide_secrets::certificates::Certificate {
+                issuing_ca: CA_PEM.as_bytes().to_vec(),
+                private_key: key_pem.as_bytes().to_vec(),
+                public_key: cert_pem.into_bytes(),
+            },
+        );
+        provider
+    }
+
+    /// Only the key-generating path returns a private key; a CSR keeps the key
+    /// with the caller and the response says so by leaving it unset.
+    #[tokio::test]
+    async fn site_ca_credentials_return_a_key_only_without_a_csr() {
+        let provider = provider_issuing(cert_pem_expiring(2030), KEY_PEM);
+        let csr = csr_pem();
+        let cases = [
+            ("no csr", None, Some(KEY_PEM)),
+            ("csr", Some(csr.as_str()), None),
+        ];
+        for (scenario, csr_pem, expected_key) in cases {
+            let response = issue_site_ca_credentials(&provider, "machine-1", csr_pem)
+                .await
+                .unwrap();
+
+            assert_eq!(response.ca_pem, CA_PEM, "{scenario}");
+            assert_eq!(
+                response.client_key_pem.as_deref(),
+                expected_key,
+                "{scenario}"
+            );
+            assert_eq!(
+                response.not_after.unwrap().seconds,
+                1_893_542_400,
+                "{scenario}"
+            );
+        }
+    }
+
+    /// A CSR that does not parse is rejected before it reaches the issuer.
+    #[tokio::test]
+    async fn site_ca_credentials_reject_an_unparseable_csr() {
+        let provider = provider_issuing(cert_pem_expiring(2030), KEY_PEM);
+
+        let result = issue_site_ca_credentials(&provider, "machine-1", Some("not pem")).await;
+
+        assert!(matches!(result, Err(CarbideError::InvalidArgument(_))));
+    }
 }

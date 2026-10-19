@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "nico-dpu-otel-agent.fullname" . }}
+  labels:
+    {{- include "nico-dpu-otel-agent.labels" . | nindent 4 }}
+    {{- with .Values.serviceDaemonSet.labels }}
+      {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- with .Values.serviceDaemonSet.annotations }}
+      {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.serviceDaemonSet.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "nico-dpu-otel-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- /* Roll the pods when a chart value changes the agent's config. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.serviceDaemonSet.annotations }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "nico-dpu-otel-agent.selectorLabels" . | nindent 8 }}
+        {{- with .Values.serviceDaemonSet.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- if not (empty .Values.serviceDaemonSet.nodeSelector) }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+              {{- toYaml .Values.serviceDaemonSet.nodeSelector | nindent 12 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: nico-dpu-otel-agent
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config-path=/etc/forge-dpu-otel-agent/config.toml"
+            - run
+          {{- with toYaml .Values.serviceDaemonSet.resources }}
+          resources:
+            limits:
+              {{- . | nindent 14 }}
+            requests:
+              {{- . | nindent 14 }}
+          {{- end }}
+          env:
+            - name: RUST_BACKTRACE
+              value: "full"
+            - name: RUST_LIB_BACKTRACE
+              value: "0"
+            - name: RUST_LOG
+              value: "info"
+            - name: IGNORE_MGMT_VRF
+              value: "1"
+          volumeMounts:
+            - name: agent-config
+              mountPath: /etc/forge-dpu-otel-agent/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: nico-certs
+              mountPath: {{ .Values.certsDir | default "/opt/forge" }}
+      volumes:
+        - name: agent-config
+          configMap:
+            name: {{ include "nico-dpu-otel-agent.fullname" . }}-config
+        - name: nico-certs
+          hostPath:
+            path: {{ .Values.certsDir | default "/opt/forge" }}
+            type: DirectoryOrCreate

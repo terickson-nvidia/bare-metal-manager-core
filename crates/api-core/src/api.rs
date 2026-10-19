@@ -966,6 +966,13 @@ impl Forge for Api {
         crate::handlers::credential::renew_machine_certificate(self, request).await
     }
 
+    async fn get_obs_gateway_credentials(
+        &self,
+        request: Request<rpc::GetObsGatewayCredentialsRequest>,
+    ) -> Result<Response<rpc::GetObsGatewayCredentialsResponse>, Status> {
+        crate::handlers::credential::get_obs_gateway_credentials(self, request).await
+    }
+
     async fn discover_machine(
         &self,
         request: Request<rpc::MachineDiscoveryInfo>,

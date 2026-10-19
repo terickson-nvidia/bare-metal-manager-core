@@ -1,0 +1,120 @@
+# The agent's config.toml is rendered from chart values. The default rendering
+# is mirrored by `CHART_DEFAULT_CONFIG` in crates/dpu-otel-agent/src/config.rs,
+# which proves the agent parses it; keep the two identical.
+suite: agent config.toml
+templates: [configmap.yaml, daemonset.yaml]
+tests:
+  - it: renders every setting at its default
+    template: configmap.yaml
+    asserts:
+      - equal:
+          path: data["config.toml"]
+          value: |
+            [forge-system]
+            api-server = "https://carbide-api.forge"
+            root-ca = "/opt/forge/forge_root.pem"
+            client-cert = "/opt/forge/machine_cert.pem"
+            client-key = "/opt/forge/machine_cert.key"
+
+            [period]
+            main-loop-idle-secs = 30
+
+            [obs-gateway]
+            ca-path = "/opt/forge/obs-gateway/ca.pem"
+            client-cert-path = "/opt/forge/obs-gateway/client.pem"
+            client-key-path = "/opt/forge/obs-gateway/client.key"
+            use-csr = false
+            min-fetch-secs = 300
+            max-fetch-secs = 604800
+
+  - it: renders every override
+    template: configmap.yaml
+    set:
+      certsDir: /var/certs
+      mainLoopIdleSecs: 10
+      nicoApi:
+        url: https://api.example:443
+        rootCaFile: root.pem
+        clientCertFile: api.pem
+        clientKeyFile: api.key
+      obsGateway:
+        caFile: o/ca.pem
+        clientCertFile: o/cert.pem
+        clientKeyFile: o/key.pem
+        useCsr: true
+        minFetchSecs: 60
+        maxFetchSecs: 3600
+    asserts:
+      - equal:
+          path: data["config.toml"]
+          value: |
+            [forge-system]
+            api-server = "https://api.example:443"
+            root-ca = "/var/certs/root.pem"
+            client-cert = "/var/certs/api.pem"
+            client-key = "/var/certs/api.key"
+
+            [period]
+            main-loop-idle-secs = 10
+
+            [obs-gateway]
+            ca-path = "/var/certs/o/ca.pem"
+            client-cert-path = "/var/certs/o/cert.pem"
+            client-key-path = "/var/certs/o/key.pem"
+            use-csr = true
+            min-fetch-secs = 60
+            max-fetch-secs = 3600
+
+  - it: leaves out the obs-gateway section when disabled
+    template: configmap.yaml
+    set:
+      obsGateway:
+        enabled: false
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: obs-gateway
+
+  - it: mounts the certificate directory the config points at
+    template: daemonset.yaml
+    set:
+      certsDir: /var/certs
+      image:
+        repository: test
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: nico-certs
+            mountPath: /var/certs
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: nico-certs
+            hostPath:
+              path: /var/certs
+              type: DirectoryOrCreate
+
+  - it: rejects fetch bounds the agent would refuse
+    template: configmap.yaml
+    set:
+      obsGateway:
+        minFetchSecs: 59
+    asserts:
+      - failedTemplate: {}
+
+  - it: rejects an obs-gateway setting unset to null
+    template: configmap.yaml
+    set:
+      obsGateway:
+        useCsr: null
+    asserts:
+      - failedTemplate: {}
+
+  - it: rejects a file name that leaves certsDir
+    template: configmap.yaml
+    set:
+      obsGateway:
+        caFile: ../../etc/ca.pem
+    asserts:
+      - failedTemplate: {}

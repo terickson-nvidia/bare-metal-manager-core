@@ -1,0 +1,27 @@
+{{- $certsDir := .Values.certsDir | default "/opt/forge" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nico-dpu-otel-agent.fullname" . }}-config
+  labels:
+    {{- include "nico-dpu-otel-agent.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    [forge-system]
+    api-server = {{ .Values.nicoApi.url | quote }}
+    root-ca = {{ printf "%s/%s" $certsDir .Values.nicoApi.rootCaFile | quote }}
+    client-cert = {{ printf "%s/%s" $certsDir .Values.nicoApi.clientCertFile | quote }}
+    client-key = {{ printf "%s/%s" $certsDir .Values.nicoApi.clientKeyFile | quote }}
+
+    [period]
+    main-loop-idle-secs = {{ .Values.mainLoopIdleSecs | int64 }}
+    {{- if .Values.obsGateway.enabled }}
+
+    [obs-gateway]
+    ca-path = {{ printf "%s/%s" $certsDir .Values.obsGateway.caFile | quote }}
+    client-cert-path = {{ printf "%s/%s" $certsDir .Values.obsGateway.clientCertFile | quote }}
+    client-key-path = {{ printf "%s/%s" $certsDir .Values.obsGateway.clientKeyFile | quote }}
+    use-csr = {{ .Values.obsGateway.useCsr }}
+    min-fetch-secs = {{ .Values.obsGateway.minFetchSecs | int64 }}
+    max-fetch-secs = {{ .Values.obsGateway.maxFetchSecs | int64 }}
+    {{- end }}

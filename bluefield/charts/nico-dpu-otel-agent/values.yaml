@@ -1,0 +1,57 @@
+### DPF contract ###
+serviceDaemonSet:
+  nodeSelector:
+  labels: {}
+  annotations: {}
+  updateStrategy: {}
+  resources: {}
+exposedPorts:
+  labels: {}
+  ports: {}
+
+### Directory on the DPU host, also the container mountPath, that holds every
+### certificate file named below. The NICo API certificate files are
+### provisioned there by nico-dpu-agent; this chart only renews them.
+certsDir: /opt/forge
+
+### Service specific values ###
+image:
+  repository: ""
+  pullPolicy: IfNotPresent
+  tag: ""
+imagePullSecrets: []
+podSecurityContext:
+  runAsUser: 0
+  runAsGroup: 0
+securityContext: {}
+
+### The NICo API endpoint and the client certificate the agent authenticates
+### with. File names are relative to certsDir. Rendered into [forge-system].
+nicoApi:
+  url: https://carbide-api.forge
+  rootCaFile: forge_root.pem
+  clientCertFile: machine_cert.pem
+  clientKeyFile: machine_cert.key
+
+### The obs-gateway credentials the collector uses for OTLP export, fetched with
+### GetObsGatewayCredentials and kept separate from the NICo API certificate.
+### File names are relative to certsDir, and nico-otelcol must be pointed at them.
+### false omits the [obs-gateway] section, and the agent then fetches nothing.
+obsGateway:
+  enabled: true
+  caFile: obs-gateway/ca.pem
+  clientCertFile: obs-gateway/client.pem
+  clientKeyFile: obs-gateway/client.key
+  # Generate the private key on the DPU and send a CSR, so the key never crosses
+  # the network. A credential source that cannot sign a CSR returns its own key,
+  # which is used instead. Off by default, so the credential source sees no
+  # request field it has not been tested with.
+  useCsr: false
+  # Bounds, in seconds, on the wait between fetches. The wait itself follows the
+  # received certificate's lifetime. minFetchSecs is at least 60 and
+  # maxFetchSecs at most 2592000 (30 days).
+  minFetchSecs: 300
+  maxFetchSecs: 604800
+
+### Seconds the agent's main loop sleeps between iterations.
+mainLoopIdleSecs: 30

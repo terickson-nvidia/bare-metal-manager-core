@@ -51,4 +51,20 @@ impl CertificateProvider for TestCertificateProvider {
 
         Ok(certificate.clone())
     }
+
+    async fn sign_certificate(
+        &self,
+        unique_identifier: &str,
+        _csr_pem: &str,
+    ) -> Result<Certificate, SecretsError> {
+        let mut certificates = self.certificates.lock().await;
+        let certificate = certificates
+            .entry(unique_identifier.to_string())
+            .or_insert(Certificate::default());
+
+        Ok(Certificate {
+            private_key: Vec::new(),
+            ..certificate.clone()
+        })
+    }
 }

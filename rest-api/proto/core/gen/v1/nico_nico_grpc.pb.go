@@ -125,6 +125,7 @@ const (
 	Forge_ForgeAgentControl_FullMethodName                                  = "/forge.Forge/ForgeAgentControl"
 	Forge_DiscoverMachine_FullMethodName                                    = "/forge.Forge/DiscoverMachine"
 	Forge_RenewMachineCertificate_FullMethodName                            = "/forge.Forge/RenewMachineCertificate"
+	Forge_GetObsGatewayCredentials_FullMethodName                           = "/forge.Forge/GetObsGatewayCredentials"
 	Forge_DiscoveryCompleted_FullMethodName                                 = "/forge.Forge/DiscoveryCompleted"
 	Forge_CleanupMachineCompleted_FullMethodName                            = "/forge.Forge/CleanupMachineCompleted"
 	Forge_ReportForgeScoutError_FullMethodName                              = "/forge.Forge/ReportForgeScoutError"
@@ -775,6 +776,9 @@ type ForgeClient interface {
 	// PRIVILEGED: Creates a new machine from nothing
 	DiscoverMachine(ctx context.Context, in *MachineDiscoveryInfo, opts ...grpc.CallOption) (*MachineDiscoveryResult, error)
 	RenewMachineCertificate(ctx context.Context, in *MachineCertificateRenewRequest, opts ...grpc.CallOption) (*MachineCertificateResult, error)
+	// Returns the mTLS credentials a DPU uses to export telemetry to obs-gateway.
+	// The caller is identified by the client certificate on the TLS channel.
+	GetObsGatewayCredentials(ctx context.Context, in *GetObsGatewayCredentialsRequest, opts ...grpc.CallOption) (*GetObsGatewayCredentialsResponse, error)
 	DiscoveryCompleted(ctx context.Context, in *MachineDiscoveryCompletedRequest, opts ...grpc.CallOption) (*MachineDiscoveryCompletedResponse, error)
 	CleanupMachineCompleted(ctx context.Context, in *MachineCleanupInfo, opts ...grpc.CallOption) (*MachineCleanupResult, error)
 	// Invoked by nico-scout whenever a certain Machine can not be properly acted on
@@ -2670,6 +2674,16 @@ func (c *forgeClient) RenewMachineCertificate(ctx context.Context, in *MachineCe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineCertificateResult)
 	err := c.cc.Invoke(ctx, Forge_RenewMachineCertificate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *forgeClient) GetObsGatewayCredentials(ctx context.Context, in *GetObsGatewayCredentialsRequest, opts ...grpc.CallOption) (*GetObsGatewayCredentialsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetObsGatewayCredentialsResponse)
+	err := c.cc.Invoke(ctx, Forge_GetObsGatewayCredentials_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -7296,6 +7310,9 @@ type ForgeServer interface {
 	// PRIVILEGED: Creates a new machine from nothing
 	DiscoverMachine(context.Context, *MachineDiscoveryInfo) (*MachineDiscoveryResult, error)
 	RenewMachineCertificate(context.Context, *MachineCertificateRenewRequest) (*MachineCertificateResult, error)
+	// Returns the mTLS credentials a DPU uses to export telemetry to obs-gateway.
+	// The caller is identified by the client certificate on the TLS channel.
+	GetObsGatewayCredentials(context.Context, *GetObsGatewayCredentialsRequest) (*GetObsGatewayCredentialsResponse, error)
 	DiscoveryCompleted(context.Context, *MachineDiscoveryCompletedRequest) (*MachineDiscoveryCompletedResponse, error)
 	CleanupMachineCompleted(context.Context, *MachineCleanupInfo) (*MachineCleanupResult, error)
 	// Invoked by nico-scout whenever a certain Machine can not be properly acted on
@@ -8465,6 +8482,9 @@ func (UnimplementedForgeServer) DiscoverMachine(context.Context, *MachineDiscove
 }
 func (UnimplementedForgeServer) RenewMachineCertificate(context.Context, *MachineCertificateRenewRequest) (*MachineCertificateResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method RenewMachineCertificate not implemented")
+}
+func (UnimplementedForgeServer) GetObsGatewayCredentials(context.Context, *GetObsGatewayCredentialsRequest) (*GetObsGatewayCredentialsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetObsGatewayCredentials not implemented")
 }
 func (UnimplementedForgeServer) DiscoveryCompleted(context.Context, *MachineDiscoveryCompletedRequest) (*MachineDiscoveryCompletedResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DiscoveryCompleted not implemented")
@@ -11634,6 +11654,24 @@ func _Forge_RenewMachineCertificate_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ForgeServer).RenewMachineCertificate(ctx, req.(*MachineCertificateRenewRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Forge_GetObsGatewayCredentials_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetObsGatewayCredentialsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ForgeServer).GetObsGatewayCredentials(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Forge_GetObsGatewayCredentials_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ForgeServer).GetObsGatewayCredentials(ctx, req.(*GetObsGatewayCredentialsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -19975,6 +20013,10 @@ var Forge_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RenewMachineCertificate",
 			Handler:    _Forge_RenewMachineCertificate_Handler,
+		},
+		{
+			MethodName: "GetObsGatewayCredentials",
+			Handler:    _Forge_GetObsGatewayCredentials_Handler,
 		},
 		{
 			MethodName: "DiscoveryCompleted",
